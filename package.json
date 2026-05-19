@@ -1,0 +1,30 @@
+{
+  "name": "core-oauth-gateway",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start -p ${PORT:-3000}",
+    "typecheck": "tsc --noEmit",
+    "verify:jwt": "node scripts/verify-jwt.mjs",
+    "client:keypair": "node scripts/generate-client-keypair.mjs",
+    "client:jks": "node scripts/generate-client-jks.mjs",
+    "client:assertion": "node scripts/create-client-assertion.mjs",
+    "jwt-bearer:assertion": "node scripts/create-jwt-bearer-assertion.mjs",
+    "client:hash-secret": "node scripts/hash-client-secret.mjs",
+    "security:scan": "node scripts/security-scan.mjs"
+  },
+  "dependencies": {
+    "@smb-tech/logger-node": "^1.0.1",
+    "next": "^14.2.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  },
+  "devDependencies": {
+    "@types/node": "^20.17.0",
+    "@types/react": "^18.3.12",
+    "@types/react-dom": "^18.3.1",
+    "typescript": "^5.6.3"
+  }
+}

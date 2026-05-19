@@ -1,0 +1,27 @@
+services:
+  - type: web
+    name: core-oauth-gateway
+    runtime: node
+    plan: starter
+    buildCommand: npm ci && npm run build
+    startCommand: npm run start
+    healthCheckPath: /.well-known/openid-configuration
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: LOG_LEVEL
+        value: INFO
+      - key: LOGGER_MODE
+        value: async
+      - key: LOGGER_INTERNAL_METRICS_ENABLED
+        value: "false"
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false
+      - key: SIGNING_KEY_ENCRYPTION_SECRET
+        sync: false
+      - key: OAUTH_TOKEN_ENCRYPTION_SECRET
+        sync: false
+      - key: AUTH_PROVIDER_LOGIN_URL
+        sync: false
