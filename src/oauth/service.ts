@@ -859,12 +859,11 @@ async function refreshTokenGrant(
 
   const client = getStore().clients.get(stored.clientId);
   if (!client) return invalidClient();
-  const clientAuth = await authenticateClient(request, params, baseUrl, {
-    allowPublic: true,
-    required: client.type === "confidential",
-    expectedClientId: client.clientId
-  });
-  if (!clientAuth.ok) return clientAuth.response;
+  if (!client.grantTypes.includes("refresh_token")) {
+    return oauthError("unauthorized_client", "OAuth 2.0 Parameter: grant_type", {
+      errorUri: RFC6749_TOKEN_ERROR_URI
+    });
+  }
 
   const scope = normalizeRequestedScope(params.get("scope") ?? stored.scope, client);
   if (!scope.ok) return scope.response;
