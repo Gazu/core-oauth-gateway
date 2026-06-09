@@ -21,6 +21,7 @@ The service keeps public HTTP routes versioned under `/oauth2/v1/*`, supports `p
 - `POST /oauth2/v1/revokeById`
 - `POST /oauth2/v1/revokeBySID`
 - `GET|POST /oauth2/v1/userinfo`
+- `GET /health`
 - `GET /.well-known/openid-configuration`
 
 ## Requirements
@@ -239,13 +240,23 @@ OAUTH_PASSWORD_USERS_JSON='{"user":{"password":"<password>","claims":{"sub":"use
 
 Do not commit real password-grant users or credentials.
 
+## Health Check
+
+`GET /health` validates that the service can reach Supabase with the configured server-side credentials. It performs a lightweight read against `oauth_clients` and returns `200` when Supabase is reachable, or `503` when the database check fails.
+
+Example:
+
+```bash
+curl -s https://core-oauth-gateway.onrender.com/health
+```
+
 ## Render Deployment
 
 `render.yaml` defines a Node web service:
 
-- build command: `npm ci && npm run build`
+- build command: `npm ci --include=dev && npm run build`
 - start command: `npm run start`
-- health check path: `/.well-known/openid-configuration`
+- health check path: `/health`
 
 Configure all secrets in Render as environment variables. Do not commit production values.
 

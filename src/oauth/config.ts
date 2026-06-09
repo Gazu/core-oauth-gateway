@@ -26,13 +26,5 @@ export const PASSWORD_GRANT_ENABLED = process.env.OAUTH_PASSWORD_GRANT_ENABLED =
 export const PASSWORD_GRANT_USERS_JSON = process.env.OAUTH_PASSWORD_USERS_JSON;
 
 export const SUPPORTED_SCOPES = [
-  "openid",
-  "profile",
-  "standard",
-  "scope1",
-  "scope2",
-  "passport:oauth:introspect:post",
-  "postingmanager_sg",
-  "testing",
-  "baas:ca:auth:test"
+  "openid"
 ];

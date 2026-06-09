@@ -105,7 +105,7 @@ export async function openIdConfigurationHandler(request: NextRequest): Promise<
     issuer: baseUrl,
     authorization_endpoint: `${baseUrl}/oauth2/v1/authorize`,
     service_documentation: "https://docs.spring.io/spring-authorization-server/reference/getting-started.html",
-    claims_supported: ["sub", "email", "scope", "profile", "idt", "userId", "user_id"],
+    claims_supported: ["sub", "email", "user_id"],
     require_pushed_authorization_requests: false,
     token_endpoint_auth_methods_supported: ["private_key_jwt", "client_secret_basic"],
     response_modes_supported: ["query", "query.jwt", "jwt"],
@@ -836,7 +836,8 @@ async function jwtBearerGrant(params: URLSearchParams, baseUrl: string): Promise
       subject,
       scope: scope.value,
       baseUrl,
-      claims: payload
+      claims: payload,
+      includeRefreshToken: client.grantTypes.includes("refresh_token")
     })
   );
 }
