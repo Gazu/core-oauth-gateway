@@ -467,6 +467,7 @@ export async function introspectionHandler(request: NextRequest): Promise<Respon
   });
 
   return jsonResponse({
+    ...introspectionCustomClaims(stored.claims),
     active: true,
     sub: stored.subject,
     client_id: stored.clientId,
@@ -1335,6 +1336,24 @@ function objectClaim(value: unknown): Record<string, unknown> | undefined {
 
 function cleanCustomClaims(claims: TokenClaims): TokenClaims {
   const blocked = new Set(["iss", "aud", "exp", "iat", "jti", "nbf"]);
+  return Object.fromEntries(Object.entries(claims).filter(([key]) => !blocked.has(key)));
+}
+
+function introspectionCustomClaims(claims: TokenClaims): TokenClaims {
+  const blocked = new Set([
+    "active",
+    "scope",
+    "client_id",
+    "username",
+    "token_type",
+    "exp",
+    "iat",
+    "nbf",
+    "sub",
+    "aud",
+    "iss",
+    "jti"
+  ]);
   return Object.fromEntries(Object.entries(claims).filter(([key]) => !blocked.has(key)));
 }
 

@@ -212,6 +212,28 @@ curl -s -X POST http://127.0.0.1:3000/oauth2/v1/introspect \
   -d "token=$ACCESS_TOKEN"
 ```
 
+Example active response with custom token claims:
+
+```json
+{
+  "active": true,
+  "user_id": "user-dynamic-789",
+  "azp": "<client-id>",
+  "client_metadata": {
+    "client_key": "bff-quickfade-web",
+    "login_token": true,
+    "token_format": "opaque"
+  },
+  "sub": "<subject>",
+  "client_id": "<client-id>",
+  "scope": "cl:bff:web:profile:read cl:bff:mobile:profile:read",
+  "token_type": "Bearer",
+  "exp": 1779207540,
+  "iat": 1779207240,
+  "jti": "2a9c8f2d..."
+}
+```
+
 Call UserInfo:
 
 ```bash
