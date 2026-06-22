@@ -30,29 +30,23 @@ async function rememberClientAssertionJtiInSupabase(
   });
 
   if (response.status === 409) {
-    clientAuthLogger.warn((event) => {
-      event
-        .message("Client assertion replay detected")
-        .tag("oauth")
-        .tag("client-auth")
-        .with("clientId", clientId)
-        .with("jti", jti)
-        .with("backend", "supabase");
+    clientAuthLogger.warn("Client assertion replay detected", {
+      clientId,
+      jti,
+      backend: "supabase",
+      tags: ["oauth", "client-auth"]
     });
     return false;
   }
   if (!response.ok) {
     throw new Error(`Supabase client assertion replay check failed: ${response.status} ${await response.text()}`);
   }
-  clientAuthLogger.info((event) => {
-    event
-      .message("Client assertion jti recorded")
-      .tag("oauth")
-      .tag("client-auth")
-      .with("clientId", clientId)
-      .with("jti", jti)
-      .with("expiresAt", expiresAt)
-      .with("backend", "supabase");
+  clientAuthLogger.info("Client assertion jti recorded", {
+    clientId,
+    jti,
+    expiresAt,
+    backend: "supabase",
+    tags: ["oauth", "client-auth"]
   });
   return true;
 }

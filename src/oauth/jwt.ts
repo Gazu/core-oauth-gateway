@@ -1,11 +1,17 @@
 import {
-  createPublicKey,
   createHash,
-  createSign,
-  createVerify,
   randomBytes,
-  randomUUID
+  randomUUID,
+  type KeyObject
 } from "crypto";
+import {
+  normalizeAudience as frameworkNormalizeAudience,
+  nowSeconds as frameworkNowSeconds,
+  parseJwt,
+  publicKeyFromJwk,
+  signJwtRs256,
+  verifyJwtRs256
+} from "@smb-tech/service-framework-js";
 import { getActiveSigningKey, publicJwks } from "./signing-keys";
 import type { JwtPayload, OAuthJwks } from "./types";
 
@@ -15,10 +21,6 @@ export type JwtHeader = {
   kid?: string;
   [key: string]: unknown;
 };
-
-function base64Url(input: Buffer | string): string {
-  return Buffer.from(input).toString("base64url");
-}
 
 export async function publicJwkSet() {
   return publicJwks();
@@ -37,7 +39,7 @@ export function s256(verifier: string): string {
 }
 
 export function nowSeconds(): number {
-  return Math.floor(Date.now() / 1000);
+  return frameworkNowSeconds();
 }
 
 export function jwtId(): string {
@@ -46,45 +48,26 @@ export function jwtId(): string {
 
 export async function signJwt(payload: JwtPayload, header?: Record<string, unknown>): Promise<string> {
   const keyMaterial = await getActiveSigningKey();
-  const jwtHeader = {
-    typ: "JWT",
-    alg: "RS256",
+  return signJwtWithKey(payload, keyMaterial, header);
+}
+
+export function signJwtWithKey(
+  payload: JwtPayload,
+  keyMaterial: { kid: string; privateKey: KeyObject },
+  header?: Record<string, unknown>
+): string {
+  return signJwtRs256(payload, keyMaterial.privateKey, {
     kid: keyMaterial.kid,
     ...header
-  };
-  const encodedHeader = base64Url(JSON.stringify(jwtHeader));
-  const encodedPayload = base64Url(JSON.stringify(payload));
-  const signingInput = `${encodedHeader}.${encodedPayload}`;
-  const signer = createSign("RSA-SHA256");
-  signer.update(signingInput);
-  signer.end();
-  const signature = signer.sign(keyMaterial.privateKey).toString("base64url");
-
-  return `${signingInput}.${signature}`;
+  });
 }
 
 export function decodeJwt<T extends JwtPayload = JwtPayload>(jwt: string): T | null {
-  const parts = jwt.split(".");
-  if (parts.length < 2) return null;
-
-  try {
-    const payload = Buffer.from(parts[1], "base64url").toString("utf8");
-    return JSON.parse(payload) as T;
-  } catch {
-    return null;
-  }
+  return (parseJwt(jwt)?.payload as T | undefined) ?? null;
 }
 
 export function decodeJwtHeader(jwt: string): JwtHeader | null {
-  const parts = jwt.split(".");
-  if (parts.length !== 3) return null;
-
-  try {
-    const header = Buffer.from(parts[0], "base64url").toString("utf8");
-    return JSON.parse(header) as JwtHeader;
-  } catch {
-    return null;
-  }
+  return (parseJwt(jwt)?.header as JwtHeader | undefined) ?? null;
 }
 
 export function verifyJwtSignature(jwt: string, jwks: OAuthJwks): boolean {
@@ -100,10 +83,7 @@ export function verifyJwtSignature(jwt: string, jwks: OAuthJwks): boolean {
   if (!jwk) return false;
 
   try {
-    const verifier = createVerify("RSA-SHA256");
-    verifier.update(`${parts[0]}.${parts[1]}`);
-    verifier.end();
-    return verifier.verify(createPublicKey({ key: jwk, format: "jwk" }), parts[2], "base64url");
+    return verifyJwtRs256(jwt, publicKeyFromJwk(jwk));
   } catch {
     return false;
   }
@@ -115,7 +95,5 @@ export function isJwtExpired(payload: JwtPayload, skewSeconds = 0): boolean {
 }
 
 export function normalizeAudience(audience: unknown): string[] {
-  if (Array.isArray(audience)) return audience.filter((entry): entry is string => typeof entry === "string");
-  if (typeof audience === "string") return [audience];
-  return [];
+  return frameworkNormalizeAudience(audience);
 }

@@ -1,30 +1,42 @@
 {
   "name": "core-oauth-gateway",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
+  "engines": {
+    "node": ">=20"
+  },
   "scripts": {
     "dev": "next dev",
     "build": "next build",
-    "start": "next start -p ${PORT:-3000}",
+    "start": "if [ -f .env.local ]; then HOSTNAME=0.0.0.0 node --env-file=.env.local .next/standalone/server.js; else HOSTNAME=0.0.0.0 node .next/standalone/server.js; fi",
+    "lint": "eslint .",
+    "test": "vitest run",
     "typecheck": "tsc --noEmit",
     "verify:jwt": "node scripts/verify-jwt.mjs",
-    "client:keypair": "node scripts/generate-client-keypair.mjs",
-    "client:jks": "node scripts/generate-client-jks.mjs",
-    "client:assertion": "node scripts/create-client-assertion.mjs",
-    "jwt-bearer:assertion": "node scripts/create-jwt-bearer-assertion.mjs",
+    "client:assertion": "service-framework-js client-assertion",
+    "jwt-bearer:assertion": "service-framework-js jwt-bearer-assertion",
+    "p12:base64": "service-framework-js p12-base64",
+    "p12:password-base64": "service-framework-js password-base64",
+    "p12:public-key": "node scripts/p12-public-key.mjs",
     "client:hash-secret": "node scripts/hash-client-secret.mjs",
     "security:scan": "node scripts/security-scan.mjs"
   },
   "dependencies": {
     "@smb-tech/logger-node": "^1.0.1",
+    "@smb-tech/service-framework-js": "0.2.0",
     "next": "^14.2.0",
     "react": "^18.3.1",
     "react-dom": "^18.3.1"
   },
   "devDependencies": {
+    "@eslint/js": "^9.39.4",
     "@types/node": "^20.17.0",
     "@types/react": "^18.3.12",
     "@types/react-dom": "^18.3.1",
-    "typescript": "^5.6.3"
+    "eslint": "^9.39.4",
+    "globals": "^16.5.0",
+    "typescript": "^5.6.3",
+    "typescript-eslint": "^8.61.0",
+    "vitest": "^3.2.4"
   }
 }

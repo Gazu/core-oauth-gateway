@@ -1,5 +1,6 @@
 import { NextResponse, type NextRequest } from "next/server";
 import { randomUUID } from "crypto";
+import { getCurrentTraceContext } from "@smb-tech/service-framework-js";
 import {
   RFC6749_AUTH_ERROR_URI,
   RFC6749_TOKEN_ERROR_URI
@@ -21,7 +22,10 @@ export function oauthHeaders(headers?: HeadersInput): Headers {
   const responseHeaders = new Headers(headers);
   responseHeaders.set("Cache-Control", "no-store");
   responseHeaders.set("Pragma", "no-cache");
-  responseHeaders.set("Gazu-OAuth-Request-Id", randomUUID());
+  responseHeaders.set(
+    "Gazu-OAuth-Request-Id",
+    getCurrentTraceContext()?.requestId ?? randomUUID()
+  );
   return responseHeaders;
 }
 

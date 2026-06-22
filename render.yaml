@@ -23,5 +23,7 @@ services:
         sync: false
       - key: OAUTH_TOKEN_ENCRYPTION_SECRET
         sync: false
-      - key: AUTH_PROVIDER_LOGIN_URL
-        sync: false
+      - key: OAUTH_AUDIT_PERSISTENCE_MODE
+        value: all
+      - key: OAUTH_AUDIT_TIMEOUT_MS
+        value: "2000"

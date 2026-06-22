@@ -18,19 +18,30 @@ export async function healthHandler(): Promise<Response> {
 
   try {
     requireSupabaseRuntime();
-    const url = supabaseRestUrl("oauth_clients");
-    url.searchParams.set("select", "client_id");
-    url.searchParams.set("limit", "1");
-
-    const response = await fetch(url, {
-      headers: supabaseHeaders(),
-      cache: "no-store"
-    });
+    const resources = [
+      { table: "oauth_clients", select: "client_id" },
+      { table: "oauth_authentication_providers", select: "provider_id,login_url" }
+    ];
+    const responses = await Promise.all(
+      resources.map(({ table, select }) => {
+        const url = supabaseRestUrl(table);
+        url.searchParams.set("select", select);
+        url.searchParams.set("limit", "1");
+        return fetch(url, {
+          headers: supabaseHeaders(),
+          cache: "no-store"
+        });
+      })
+    );
     const latencyMs = Date.now() - startedAt;
+    const failedIndex = responses.findIndex((response) => !response.ok);
 
-    if (!response.ok) {
+    if (failedIndex >= 0) {
       return jsonResponse(
-        healthError(`Supabase query failed with status ${response.status}`, latencyMs),
+        healthError(
+          `Supabase ${resources[failedIndex].table} query failed with status ${responses[failedIndex].status}`,
+          latencyMs
+        ),
         { status: 503 }
       );
     }
@@ -41,7 +52,7 @@ export async function healthHandler(): Promise<Response> {
       checks: {
         supabase: {
           status: "ok",
-          latency_ms: latencyMs,
+          latency_ms: latencyMs
         }
       }
     } satisfies HealthBody);

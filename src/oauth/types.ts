@@ -12,6 +12,18 @@ export type OAuthJwks = {
   keys: OAuthPublicJwk[];
 };
 
+export type OAuthAuthenticationProvider = {
+  providerId: string;
+  providerName: string;
+  issuer: string;
+  loginUrl: string;
+  jwks?: OAuthJwks;
+  jwksUri?: string;
+  userJwtMaxTtlSeconds: number;
+  clockSkewSeconds: number;
+  metadata?: Record<string, unknown>;
+};
+
 export type OAuthClient = {
   clientId: string;
   clientName: string;
@@ -38,6 +50,7 @@ export type OAuthClient = {
 
 export type AuthorizationRequest = {
   oauthKey: string;
+  oauthFlowId: string;
   clientId: string;
   redirectUri: string;
   scope: string;
@@ -61,6 +74,7 @@ export type PushedAuthorizationRequest = {
 
 export type AuthorizationCode = {
   code: string;
+  oauthFlowId: string;
   clientId: string;
   redirectUri: string;
   scope: string;
@@ -77,6 +91,7 @@ export type AuthorizationCode = {
 export type StoredAccessToken = {
   token: string;
   tokenId: string;
+  oauthFlowId: string;
   jwt: string;
   clientId: string;
   subject: string;
@@ -90,6 +105,7 @@ export type StoredAccessToken = {
 export type StoredRefreshToken = {
   token: string;
   tokenId: string;
+  oauthFlowId: string;
   clientId: string;
   subject: string;
   scope: string;
@@ -101,6 +117,7 @@ export type StoredRefreshToken = {
 
 export type OAuthStore = {
   clients: Map<string, OAuthClient>;
+  authenticationProviders: Map<string, OAuthAuthenticationProvider>;
   authorizationRequests: Map<string, AuthorizationRequest>;
   pushedRequests: Map<string, PushedAuthorizationRequest>;
   authorizationCodes: Map<string, AuthorizationCode>;

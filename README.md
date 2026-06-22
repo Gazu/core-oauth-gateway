@@ -1,8 +1,10 @@
 # core-oauth-gateway
 
-`core-oauth-gateway` is a Next.js + TypeScript OAuth2/OIDC authorization server. It is designed for production-style deployments where Supabase is the source of truth for OAuth clients, opaque tokens, signing keys, and `client_assertion` replay protection.
+`core-oauth-gateway` is a Next.js + TypeScript OAuth2/OIDC authorization server. It is designed for production-style deployments where Supabase is the source of truth for OAuth clients, access and refresh tokens, authentication providers, signing keys, functional audit events, and `client_assertion` replay protection.
 
-The service keeps public HTTP routes versioned under `/oauth2/v1/*`, supports `private_key_jwt`, JKS/PEM-backed client assertions, JWT bearer grants, opaque-token introspection, and signed JWT access tokens for clients configured with `opaque_token=false`.
+The service keeps public HTTP routes versioned under `/oauth2/v1/*`, supports `private_key_jwt`, P12-backed client assertions, JWT bearer grants, opaque-token introspection, and signed JWT access tokens for clients configured with `opaque_token=false`.
+
+Cross-cutting Next.js tracing, structured logging, error presentation, JWT primitives and P12 tooling come from `@smb-tech/service-framework-js@0.2.0`. OAuth protocol responses, Supabase persistence, signing-key rotation and grant-specific rules remain owned by this authorization server.
 
 ## Endpoints
 
@@ -23,13 +25,13 @@ The service keeps public HTTP routes versioned under `/oauth2/v1/*`, supports `p
 - `GET|POST /oauth2/v1/userinfo`
 - `GET /health`
 - `GET /.well-known/openid-configuration`
+- `GET /.well-known/oauth-authorization-server`
 
 ## Requirements
 
 - Node.js 20 or newer
 - npm
 - Supabase project with a server-side `service_role` key
-- `keytool` and `openssl` if you use JKS-backed client keys
 
 ## Local Development
 
@@ -41,18 +43,22 @@ npm run dev
 
 Local examples use `http://127.0.0.1:3000`.
 
-The service does not use local file or in-memory fallbacks for production OAuth state. Configure Supabase before running token flows that need clients, tokens, signing keys, or replay protection.
+Supabase is mandatory for OAuth clients, tokens, signing keys, and replay protection; there are no local-file fallbacks for those records. Authorization requests, PAR records, and authorization codes are still process-local, so keep a single gateway instance until those records are moved to Supabase.
+
+Authentication-provider routing and signature policy are stored in `oauth_authentication_providers`. The provider-specific `login_url` is the authorization redirect destination, while `user_jwt_max_ttl_seconds` is bounded by the global `AUTH_PROVIDER_JWT_MAX_TTL_SECONDS` ceiling.
 
 ## Configuration
 
-Set runtime secrets through your platform, not in Git:
+Set runtime configuration and secrets through your platform, not in Git:
 
 ```bash
+SERVICE_NAME=core-oauth-gateway
+SERVICE_VERSION=0.1.0
 SUPABASE_URL=https://PROJECT_REF.supabase.co
 SUPABASE_SERVICE_ROLE_KEY=<service-role-key>
 SIGNING_KEY_ENCRYPTION_SECRET=<long-random-secret>
 OAUTH_TOKEN_ENCRYPTION_SECRET=<long-random-secret>
-AUTH_PROVIDER_LOGIN_URL=http://127.0.0.1:8082/login
+AUTH_PROVIDER_JWT_MAX_TTL_SECONDS=300
 ACCESS_TOKEN_TTL_SECONDS=300
 AUTH_CODE_TTL_SECONDS=60
 REQUEST_URI_TTL_SECONDS=60
@@ -63,10 +69,23 @@ SIGNING_KEY_CACHE_SECONDS=60
 OAUTH_CLIENT_CACHE_SECONDS=60
 SUPABASE_CLEANUP_INTERVAL_SECONDS=300
 SUPABASE_EXPIRED_TOKEN_RETENTION_SECONDS=604800
+OAUTH_AUDIT_PERSISTENCE_MODE=all
+OAUTH_AUDIT_TIMEOUT_MS=2000
 LOG_LEVEL=INFO
 ```
 
+See [`.env.example`](.env.example) for every supported setting, its default, and its purpose.
+
 `SUPABASE_SERVICE_ROLE_KEY` must be the Supabase `service_role` key. Do not use the `anon` public key on the server.
+
+## Supported Grants
+
+- Authorization Code with S256 PKCE
+- Client Credentials
+- JWT Bearer (`urn:ietf:params:oauth:grant-type:jwt-bearer`)
+- Refresh Token
+- Token Exchange (`urn:ietf:params:oauth:grant-type:token-exchange`)
+- Resource Owner Password only when `OAUTH_PASSWORD_GRANT_ENABLED=true`
 
 ## Supabase
 
@@ -75,13 +94,15 @@ The `supabase/` directory is intentionally ignored by Git in this workspace. Kee
 The runtime expects these tables and RPCs to exist in Supabase:
 
 - `oauth_clients`
+- `oauth_authentication_providers`
 - `oauth_tokens`
 - `oauth_signing_keys`
 - `oauth_client_assertion_jtis`
+- `oauth_audit_events`
 - `oauth_rotate_signing_key`
 - `oauth_cleanup_expired_records`
 
-Create OAuth clients per environment. Do not commit real client IDs, client secrets, public keys, JWKS values, JKS files, PEM files, tokens, or exported production data.
+Create OAuth clients per environment. Do not commit real client IDs, client secrets, public keys, JWKS values, P12/PFX files, PEM files, tokens, or exported production data.
 
 For `private_key_jwt`, configure one of these fields in `oauth_clients`:
 
@@ -99,51 +120,36 @@ Then save the resulting `scrypt$...` value in `oauth_clients.client_secret_hash`
 
 ## Client Key Material
 
-Never commit generated key material. The repo ignores JKS, PEM, P12/PFX, `.env*`, and local secret folders by default.
+Never commit generated key material. The repo ignores PEM, P12/PFX, `.env*`, and local secret folders by default.
 
-Generate a local JKS for a client:
-
-```bash
-npm run client:jks -- \
-  --client-id "$OAUTH_CLIENT_ID" \
-  --out "$JKS_FILE" \
-  --alias "$JKS_ALIAS" \
-  --storepass "$JKS_STOREPASS" \
-  --keypass "$JKS_KEYPASS"
-```
-
-The command prints a `public_key`. Store that value in Supabase for the same client.
-
-Generate a PEM key pair instead:
+Use a P12/PFX provisioned through your approved key-management process. Encode it and its password without writing extracted private keys:
 
 ```bash
-npm run client:keypair -- \
-  --client-id "$OAUTH_CLIENT_ID" \
-  --out "$OAUTH_CLIENT_PRIVATE_KEY_FILE"
+CORE_OAUTH_P12_BASE64="$(npm run -s p12:base64 -- --p12 "$P12_FILE")"
+CORE_OAUTH_P12_PASSWORD_BASE64="$(npm run -s p12:password-base64 -- --password "$P12_PASSWORD")"
 ```
 
-The command prints a JWKS. Store that JWKS in `oauth_clients.jwks`.
+Extract only the matching public key and JWKS using the framework's in-memory P12 loader:
+
+```bash
+npm run -s p12:public-key -- \
+  --p12 "$P12_FILE" \
+  --p12-password "$P12_PASSWORD" \
+  --p12-alias "$P12_ALIAS"
+```
+
+Store the emitted `public_key` or `jwks` in the matching `oauth_clients` row. Private key material remains inside the P12 and is never written to a temporary file.
 
 ## Client Assertions
 
-Create a `private_key_jwt` client assertion from JKS:
+Create a `private_key_jwt` client assertion from P12:
 
 ```bash
 CLIENT_ASSERTION="$(npm run -s client:assertion -- \
   --client-id "$OAUTH_CLIENT_ID" \
-  --jks "$JKS_FILE" \
-  --alias "$JKS_ALIAS" \
-  --storepass "$JKS_STOREPASS" \
-  --keypass "$JKS_KEYPASS" \
-  --aud http://127.0.0.1:3000/oauth2/v1/token)"
-```
-
-Create one from a PEM private key:
-
-```bash
-CLIENT_ASSERTION="$(npm run -s client:assertion -- \
-  --client-id "$OAUTH_CLIENT_ID" \
-  --key "$OAUTH_CLIENT_PRIVATE_KEY_FILE" \
+  --p12 "$P12_FILE" \
+  --p12-password "$P12_PASSWORD" \
+  --p12-alias "$P12_ALIAS" \
   --aud http://127.0.0.1:3000/oauth2/v1/token)"
 ```
 
@@ -158,6 +164,8 @@ curl -s -X POST http://127.0.0.1:3000/oauth2/v1/token \
   -d "client_assertion=$CLIENT_ASSERTION"
 ```
 
+Omit `scope` to request all scopes configured for the client. Any explicitly requested scope must be present in `oauth_clients.scopes`.
+
 ## JWT Bearer Grant
 
 Create a JWT bearer assertion with a dynamic user claim:
@@ -166,20 +174,9 @@ Create a JWT bearer assertion with a dynamic user claim:
 JWT_BEARER_ASSERTION="$(npm run -s jwt-bearer:assertion -- \
   --client-id "$OAUTH_CLIENT_ID" \
   --user-id "user-dynamic-789" \
-  --jks "$JKS_FILE" \
-  --alias "$JKS_ALIAS" \
-  --storepass "$JKS_STOREPASS" \
-  --keypass "$JKS_KEYPASS" \
-  --aud http://127.0.0.1:3000/oauth2/v1/token)"
-```
-
-Or with a PEM private key:
-
-```bash
-JWT_BEARER_ASSERTION="$(npm run -s jwt-bearer:assertion -- \
-  --client-id "$OAUTH_CLIENT_ID" \
-  --user-id "user-dynamic-789" \
-  --key "$OAUTH_CLIENT_PRIVATE_KEY_FILE" \
+  --p12 "$P12_FILE" \
+  --p12-password "$P12_PASSWORD" \
+  --p12-alias "$P12_ALIAS" \
   --aud http://127.0.0.1:3000/oauth2/v1/token)"
 ```
 
@@ -192,11 +189,11 @@ curl -s -X POST http://127.0.0.1:3000/oauth2/v1/token \
   -d "assertion=$JWT_BEARER_ASSERTION"
 ```
 
-If the client has `opaque_token=false`, the returned `access_token` is the signed JWT itself. Otherwise, the service returns an opaque access token that can be checked through `tokeninfo` or introspection.
+If the client has `opaque_token=false`, the returned `access_token` is the signed JWT itself. Otherwise, the service returns an opaque access token that can be validated through introspection. The compatibility `tokeninfo` endpoint returns the signed JWT representation associated with an access token.
 
 ## Token Operations
 
-Exchange an opaque token for token details:
+Exchange an opaque access token for its signed JWT representation:
 
 ```bash
 curl -s -X POST http://127.0.0.1:3000/oauth2/v1/tokeninfo \
@@ -212,7 +209,26 @@ curl -s -X POST http://127.0.0.1:3000/oauth2/v1/introspect \
   -d "token=$ACCESS_TOKEN"
 ```
 
-Example active response with custom token claims:
+Refresh a token without a client assertion:
+
+```bash
+curl -s -X POST http://127.0.0.1:3000/oauth2/v1/token \
+  -H 'Content-Type: application/x-www-form-urlencoded' \
+  -d 'grant_type=refresh_token' \
+  -d "refresh_token=$REFRESH_TOKEN"
+```
+
+If `scope` is omitted, the refreshed token retains the scopes stored with the refresh token. A supplied scope must remain within the client allowlist.
+
+Revoke either an access token or a refresh token:
+
+```bash
+curl -s -X POST http://127.0.0.1:3000/oauth2/v1/revoke \
+  -H 'Content-Type: application/x-www-form-urlencoded' \
+  -d "token=$TOKEN"
+```
+
+Example active introspection response with custom token claims:
 
 ```json
 {
@@ -262,9 +278,46 @@ OAUTH_PASSWORD_USERS_JSON='{"user":{"password":"<password>","claims":{"sub":"use
 
 Do not commit real password-grant users or credentials.
 
+## Audit Events
+
+Functional audit events complement OAuth operational logs; they do not replace them. A UUID `oauthFlowId` is created as soon as `/oauth2/v1/authorize` starts, including rejected requests, and follows a valid authorization request, authorization code, access token, and refresh token. Token-only grants create a new flow identifier. Introspection and revocation recover it from the persisted token.
+
+Every event contains `auditId`, `auditType`, `auditStatus`, `requestId`, `traceId`, `spanId`, `oauthFlowId`, and `eventTimestamp`. Event-specific fields are stored in the same JSON payload. Supported audit types are:
+
+- `authorization_requested`
+- `authorization_failed`
+- `user_authenticated`
+- `authentication_failed`
+- `authorization_code_issued`
+- `tokens_issued`
+- `refresh_token_used`
+- `token_revoked`
+- `client_authenticated`
+- `client_authentication_failed`
+
+Each audit attempt logs `Audit event started` followed by `Audit event completed`. Validation, serialization, timeout, or Supabase persistence failures produce `Audit event failed` with a stable failure reason code. Audit is best-effort: an audit failure never changes or rejects the OAuth response.
+
+`OAUTH_AUDIT_PERSISTENCE_MODE` controls only writes to `oauth_audit_events`:
+
+- `all`: persist successful and failed functional audit events.
+- `errors_only`: persist only events whose `auditStatus` is `FAILURE`.
+- `disabled`: do not write functional audit events to the table.
+
+Audit lifecycle logs remain enabled in every mode. An unsupported value is reported as `audit_validation_failed` and does not interrupt OAuth.
+
+Tokens, authorization codes, and refresh tokens are represented only as `sha256:<base64url>` hashes. Query a complete flow from Supabase with:
+
+```sql
+select event_timestamp, audit_type, audit_status, audit_id, request_id,
+       trace_id, span_id, event_payload
+from public.oauth_audit_events
+where oauth_flow_id = '<oauth-flow-id>'::uuid
+order by event_timestamp, audit_id;
+```
+
 ## Health Check
 
-`GET /health` validates that the service can reach Supabase with the configured server-side credentials. It performs a lightweight read against `oauth_clients` and returns `200` when Supabase is reachable, or `503` when the database check fails.
+`GET /health` validates that the service can reach Supabase with the configured server-side credentials. It performs lightweight reads against `oauth_clients` and `oauth_authentication_providers`, including the required provider `login_url` column. It returns `200` when both checks succeed, or `503` when either check fails.
 
 Example:
 
@@ -289,23 +342,26 @@ Import:
 - `postman/core-oauth-gateway.postman_collection.json`
 - `postman/core-oauth-gateway.render.postman_environment.json`
 
-Generate assertions locally with the scripts above, then paste the generated assertion into the Postman secret variable.
+The committed files are sanitized templates. Set your own `client_id`, scopes, and base URL after import. Generate assertions locally with the P12 commands above, then store the generated values in Postman secret variables.
 
 ## Security Checklist
 
 Before pushing:
 
 ```bash
-npm run security:scan
+npm run lint
 npm run typecheck
+npm run test
+npm run security:scan
+npm run build
 ```
 
-The security scan checks for common accidental leaks such as private keys, local key files, hardcoded client IDs, inline keystore passwords, Supabase JWT keys, and old generated key material.
+The security scan checks for common accidental leaks such as private keys, local key files, hardcoded client IDs, inline key-material passwords, Supabase JWT keys, and old generated key material.
 
 Also confirm that your commit does not include:
 
 - `.env` or `.env.local`
-- JKS, PEM, P12/PFX, or private key files
+- PEM, P12/PFX, or private key files
 - Supabase service-role keys
 - real OAuth client IDs or client secrets
 - access tokens, refresh tokens, assertions, or exported production data

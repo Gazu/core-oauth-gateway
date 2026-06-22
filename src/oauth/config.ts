@@ -20,8 +20,9 @@ export const SIGNING_KEY_ROTATION_DAYS = Number(process.env.SIGNING_KEY_ROTATION
 export const SIGNING_KEY_RETENTION_DAYS = Number(process.env.SIGNING_KEY_RETENTION_DAYS ?? 45);
 export const SIGNING_KEY_CACHE_SECONDS = Number(process.env.SIGNING_KEY_CACHE_SECONDS ?? 60);
 
-export const AUTH_PROVIDER_LOGIN_URL =
-  process.env.AUTH_PROVIDER_LOGIN_URL ?? "http://localhost:8082/login";
+export const AUTH_PROVIDER_JWT_MAX_TTL_SECONDS = Number(
+  process.env.AUTH_PROVIDER_JWT_MAX_TTL_SECONDS ?? 300
+);
 export const PASSWORD_GRANT_ENABLED = process.env.OAUTH_PASSWORD_GRANT_ENABLED === "true";
 export const PASSWORD_GRANT_USERS_JSON = process.env.OAUTH_PASSWORD_USERS_JSON;
 

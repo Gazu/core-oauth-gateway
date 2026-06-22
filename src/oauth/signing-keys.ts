@@ -123,14 +123,11 @@ async function rotateSigningKeys(): Promise<void> {
   requireSupabaseRuntime();
   const nextKey = createSigningKeyRecord();
   await rotateSupabaseSigningKeys(nextKey);
-  signingKeyLogger.info((event) => {
-    event
-      .message("OAuth signing key rotated")
-      .tag("oauth")
-      .tag("jwks")
-      .with("kid", nextKey.kid)
-      .with("retireAfter", nextKey.retireAfter)
-      .with("backend", "supabase");
+  signingKeyLogger.info("OAuth signing key rotated", {
+    kid: nextKey.kid,
+    retireAfter: nextKey.retireAfter,
+    backend: "supabase",
+    tags: ["oauth", "jwks"]
   });
   (globalThis as GlobalWithSigningKeys).__coreOauthGatewaySigningKeyCache = undefined;
 }
@@ -247,7 +244,8 @@ async function listSupabaseSigningKeys(): Promise<SigningKeyRecord[]> {
   url.searchParams.set("order", "activated_at.desc");
 
   const response = await fetch(url, {
-    headers: supabaseHeaders()
+    headers: supabaseHeaders(),
+    cache: "no-store"
   });
 
   if (!response.ok) {
@@ -255,13 +253,10 @@ async function listSupabaseSigningKeys(): Promise<SigningKeyRecord[]> {
   }
 
   const rows = (await response.json()) as SupabaseSigningKeyRow[];
-  signingKeyLogger.info((event) => {
-    event
-      .message("OAuth signing keys loaded")
-      .tag("oauth")
-      .tag("jwks")
-      .with("keyCount", rows.length)
-      .with("backend", "supabase");
+  signingKeyLogger.info("OAuth signing keys loaded", {
+    keyCount: rows.length,
+    backend: "supabase",
+    tags: ["oauth", "jwks"]
   });
   return rows.map(rowToRecord);
 }

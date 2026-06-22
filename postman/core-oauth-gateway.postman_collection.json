@@ -1,0 +1,250 @@
+{
+  "info": {
+    "name": "core-oauth-gateway",
+    "description": "OAuth2/OIDC collection for core-oauth-gateway.\n\nGenerate jwt_bearer_assertion locally:\nJWT_BEARER_ASSERTION=\"$(npm run -s jwt-bearer:assertion -- --client-id {{client_id}} --user-id {{userId}} --p12 $P12_FILE --p12-password \\\"$P12_PASSWORD\\\" --p12-alias \\\"$P12_ALIAS\\\" --aud {{base_url}}/oauth2/v1/token)\"\n\nGenerate client_assertion locally for client_credentials:\nCLIENT_ASSERTION=\"$(npm run -s client:assertion -- --client-id {{client_id}} --p12 $P12_FILE --p12-password \\\"$P12_PASSWORD\\\" --p12-alias \\\"$P12_ALIAS\\\" --aud {{base_url}}/oauth2/v1/token)\"\n\nPaste generated values into Postman secret variables before running protected requests.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    { "key": "base_url", "value": "https://core-oauth-gateway.onrender.com" },
+    { "key": "client_id", "value": "<client-id>" },
+    { "key": "client_assertion_type", "value": "urn:ietf:params:oauth:client-assertion-type:jwt-bearer" },
+    { "key": "jwt_bearer_grant_type", "value": "urn:ietf:params:oauth:grant-type:jwt-bearer" },
+    { "key": "scope", "value": "standard" },
+    { "key": "userId", "value": "user-dinamico-789" },
+    { "key": "client_assertion", "value": "" },
+    { "key": "jwt_bearer_assertion", "value": "" },
+    { "key": "access_token", "value": "" },
+    { "key": "refresh_token", "value": "" },
+    { "key": "jwt_token", "value": "" }
+  ],
+  "item": [
+    {
+      "name": "Discovery",
+      "item": [
+        {
+          "name": "Health",
+          "request": {
+            "method": "GET",
+            "url": "{{base_url}}/health"
+          }
+        },
+        {
+          "name": "OpenID Configuration",
+          "request": {
+            "method": "GET",
+            "url": "{{base_url}}/.well-known/openid-configuration"
+          }
+        },
+        {
+          "name": "OAuth Authorization Server Metadata",
+          "request": {
+            "method": "GET",
+            "url": "{{base_url}}/.well-known/oauth-authorization-server"
+          }
+        },
+        {
+          "name": "JWKS / Certs",
+          "request": {
+            "method": "GET",
+            "url": "{{base_url}}/oauth2/v1/certs"
+          }
+        }
+      ]
+    },
+    {
+      "name": "JWT Bearer Grant",
+      "item": [
+        {
+          "name": "Token with dynamic user_id",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const body = pm.response.json();",
+                  "if (body.access_token) pm.collectionVariables.set('access_token', body.access_token);",
+                  "if (body.refresh_token) pm.collectionVariables.set('refresh_token', body.refresh_token);"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/x-www-form-urlencoded" }
+            ],
+            "body": {
+              "mode": "urlencoded",
+              "urlencoded": [
+                { "key": "grant_type", "value": "{{jwt_bearer_grant_type}}", "type": "text" },
+                { "key": "assertion", "value": "{{jwt_bearer_assertion}}", "type": "text" },
+                { "key": "scope", "value": "{{scope}}", "type": "text", "disabled": true }
+              ]
+            },
+            "url": "{{base_url}}/oauth2/v1/token"
+          }
+        },
+        {
+          "name": "Refresh Token",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const body = pm.response.json();",
+                  "if (body.access_token) pm.collectionVariables.set('access_token', body.access_token);",
+                  "if (body.refresh_token) pm.collectionVariables.set('refresh_token', body.refresh_token);"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/x-www-form-urlencoded" }
+            ],
+            "body": {
+              "mode": "urlencoded",
+              "urlencoded": [
+                { "key": "grant_type", "value": "refresh_token", "type": "text" },
+                { "key": "refresh_token", "value": "{{refresh_token}}", "type": "text" },
+                { "key": "scope", "value": "{{scope}}", "type": "text", "disabled": true }
+              ]
+            },
+            "url": "{{base_url}}/oauth2/v1/token"
+          }
+        }
+      ]
+    },
+    {
+      "name": "Client Credentials private_key_jwt",
+      "item": [
+        {
+          "name": "Token",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const body = pm.response.json();",
+                  "if (body.access_token) pm.collectionVariables.set('access_token', body.access_token);",
+                  "if (body.refresh_token) pm.collectionVariables.set('refresh_token', body.refresh_token);"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/x-www-form-urlencoded" }
+            ],
+            "body": {
+              "mode": "urlencoded",
+              "urlencoded": [
+                { "key": "grant_type", "value": "client_credentials", "type": "text" },
+                { "key": "scope", "value": "{{scope}}", "type": "text" },
+                { "key": "client_assertion_type", "value": "{{client_assertion_type}}", "type": "text" },
+                { "key": "client_assertion", "value": "{{client_assertion}}", "type": "text" }
+              ]
+            },
+            "url": "{{base_url}}/oauth2/v1/token"
+          }
+        }
+      ]
+    },
+    {
+      "name": "Token Operations",
+      "item": [
+        {
+          "name": "TokenInfo",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const body = pm.response.json();",
+                  "if (body.access_token) pm.collectionVariables.set('jwt_token', body.access_token);"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/x-www-form-urlencoded" }
+            ],
+            "body": {
+              "mode": "urlencoded",
+              "urlencoded": [
+                { "key": "token", "value": "{{access_token}}", "type": "text" }
+              ]
+            },
+            "url": "{{base_url}}/oauth2/v1/tokeninfo"
+          }
+        },
+        {
+          "name": "Introspection",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/x-www-form-urlencoded" }
+            ],
+            "body": {
+              "mode": "urlencoded",
+              "urlencoded": [
+                { "key": "token", "value": "{{access_token}}", "type": "text" }
+              ]
+            },
+            "url": "{{base_url}}/oauth2/v1/introspect"
+          }
+        },
+        {
+          "name": "UserInfo",
+          "request": {
+            "method": "GET",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{access_token}}" }
+            ],
+            "url": "{{base_url}}/oauth2/v1/userinfo"
+          }
+        },
+        {
+          "name": "Revoke access token",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/x-www-form-urlencoded" }
+            ],
+            "body": {
+              "mode": "urlencoded",
+              "urlencoded": [
+                { "key": "token", "value": "{{access_token}}", "type": "text" }
+              ]
+            },
+            "url": "{{base_url}}/oauth2/v1/revoke"
+          }
+        },
+        {
+          "name": "Revoke refresh token",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/x-www-form-urlencoded" }
+            ],
+            "body": {
+              "mode": "urlencoded",
+              "urlencoded": [
+                { "key": "token", "value": "{{refresh_token}}", "type": "text" }
+              ]
+            },
+            "url": "{{base_url}}/oauth2/v1/revoke"
+          }
+        }
+      ]
+    }
+  ]
+}

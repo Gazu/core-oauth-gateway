@@ -1,125 +1,77 @@
-import { LoggerConfiguration } from "@smb-tech/logger-core";
 import {
-  getNextTraceResponseHeaders,
-  NodeLogger,
-  NodeLogSink,
-  RequestContextStore,
-  withNextRequestContext
-} from "@smb-tech/logger-node";
+  DEFAULT_SENSITIVE_FIELDS,
+  createLogger,
+  createNextBffService,
+  initializeSmbLogger,
+  redactSensitiveData,
+  type LogLevel,
+  type Logger
+} from "@smb-tech/service-framework-js";
 import type { NextRequest } from "next/server";
 import { tokenHash } from "./jwt";
 
 type Handler = (request: NextRequest) => Promise<Response>;
 
-function ensureLoggerInitialized(): void {
-  LoggerConfiguration.configure({
-    level: process.env.LOG_LEVEL ?? "INFO",
-    sampleRate: Number(process.env.LOGGER_SAMPLE_RATE ?? 1),
-    sensitiveKeys: [
-      "authorization",
-      "cookie",
-      "password",
-      "secret",
-      "token",
-      "access_token",
-      "refresh_token",
-      "client_assertion",
-      "assertion",
-      "private_key",
-      "encrypted_token"
-    ],
-    errorStackEnabled: process.env.LOGGER_ERROR_STACK_ENABLED === "true"
-  });
+const serviceName = process.env.SERVICE_NAME ?? "core-oauth-gateway";
+const serviceVersion = process.env.SERVICE_VERSION ?? "0.1.0";
+const sensitiveKeys = [
+  ...DEFAULT_SENSITIVE_FIELDS,
+  "oauth_key_signature",
+  "user_jwt",
+  "encrypted_token",
+  "p12_password_base64"
+];
 
-  if (!NodeLogSink.isInitialized()) {
-    NodeLogSink.initialize({
-      mode: process.env.LOGGER_MODE === "sync" ? "sync" : "async",
-      flushIntervalMs: Number(process.env.LOGGER_FLUSH_INTERVAL_MS ?? 10),
-      maxQueueSize: Number(process.env.LOGGER_MAX_QUEUE_SIZE ?? 10000),
-      overflowStrategy: process.env.LOGGER_OVERFLOW_STRATEGY === "drop" ? "drop" : "sync-fallback",
-      shutdownTimeoutMs: Number(process.env.LOGGER_SHUTDOWN_TIMEOUT_MS ?? 2000),
-      metricsEnabled: process.env.LOGGER_INTERNAL_METRICS_ENABLED === "true"
-    });
-  }
+const loggerInitialization = initializeSmbLogger({ sensitiveKeys });
+export const oauthLogger = createOAuthLogger("OAuthServer");
+
+const service = createNextBffService({
+  env: {
+    ...process.env,
+    SERVICE_NAME: serviceName,
+    SERVICE_VERSION: serviceVersion
+  },
+  logger: oauthLogger,
+  requireBaseUrlOrTokenUrl: false,
+  requireJwt: false,
+  requireIssuer: false,
+  requireAudience: false
+});
+
+export const tokenLogger = createOAuthLogger("OAuthToken");
+export const clientAuthLogger = createOAuthLogger("OAuthClientAuth");
+export const signingKeyLogger = createOAuthLogger("OAuthSigningKeys");
+export const storeLogger = createOAuthLogger("OAuthStore");
+export const auditLogger = createOAuthLogger("OAuthAuditService");
+
+export function createOAuthLogger(
+  contextName: string,
+  writer?: (level: LogLevel, payload: Record<string, unknown>) => void
+): Logger {
+  const logger = createLogger({
+    contextName,
+    serviceName,
+    useSmbLogger: !writer,
+    writer
+  });
+  const secureMeta = (meta?: Record<string, unknown>) =>
+    redactSensitiveData(meta ?? {}, { sensitiveFields: sensitiveKeys });
+
+  return {
+    debug: (message, meta) => logger.debug(message, secureMeta(meta)),
+    info: (message, meta) => logger.info(message, secureMeta(meta)),
+    warn: (message, meta) => logger.warn(message, secureMeta(meta)),
+    error: (message, meta) => logger.error(message, secureMeta(meta))
+  };
 }
 
-ensureLoggerInitialized();
-
-export const oauthLogger = NodeLogger.get("OAuthServer");
-export const tokenLogger = NodeLogger.get("OAuthToken");
-export const clientAuthLogger = NodeLogger.get("OAuthClientAuth");
-export const signingKeyLogger = NodeLogger.get("OAuthSigningKeys");
-export const storeLogger = NodeLogger.get("OAuthStore");
-
-export function withOAuthRequestLogging(handlerName: string, handler: Handler): Handler {
-  return async (request: NextRequest): Promise<Response> => {
-    ensureLoggerInitialized();
-    const startedAt = Date.now();
-    return withNextRequestContext(request, async () => {
-      RequestContextStore.setManyMdc({
-        handler: handlerName,
-        method: request.method,
-        path: request.nextUrl.pathname
-      });
-
-      oauthLogger.info((event) => {
-        event
-          .message("OAuth request started")
-          .tag("oauth")
-          .tag("http")
-          .with("handler", handlerName)
-          .with("method", request.method)
-          .with("path", request.nextUrl.pathname);
-      });
-
-      try {
-        const response = await handler(request);
-        const durationMs = Date.now() - startedAt;
-        oauthLogger.info((event) => {
-          event
-            .message("OAuth request completed")
-            .tag("oauth")
-            .tag("http")
-            .with("handler", handlerName)
-            .with("method", request.method)
-            .with("path", request.nextUrl.pathname)
-            .with("status", response.status)
-            .with("durationMs", durationMs);
-        });
-        return withTraceHeaders(response);
-      } catch (error) {
-        const durationMs = Date.now() - startedAt;
-        oauthLogger.error((event) => {
-          event
-            .message("OAuth request failed")
-            .tag("oauth")
-            .tag("http")
-            .with("handler", handlerName)
-            .with("method", request.method)
-            .with("path", request.nextUrl.pathname)
-            .with("durationMs", durationMs)
-            .error(error);
-        });
-        throw error;
-      }
-    });
-  };
+export function withOAuthRequestLogging(_handlerName: string, handler: Handler): Handler {
+  return service.route(async (request) => {
+    await loggerInitialization;
+    return handler(request as NextRequest);
+  });
 }
 
 export function tokenFingerprint(token: string | null | undefined): string | undefined {
   return token ? tokenHash(token) : undefined;
-}
-
-function withTraceHeaders(response: Response): Response {
-  const headers = new Headers(response.headers);
-  const traceHeaders = getNextTraceResponseHeaders();
-  for (const [key, value] of Object.entries(traceHeaders)) {
-    headers.set(key, value);
-  }
-
-  return new Response(response.body, {
-    status: response.status,
-    statusText: response.statusText,
-    headers
-  });
 }

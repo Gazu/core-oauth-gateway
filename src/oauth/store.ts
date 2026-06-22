@@ -10,13 +10,11 @@ import { requireSupabaseRuntime, supabaseHeaders, supabaseRestUrl, supabaseRpcUr
 import { tokenHash } from "./jwt";
 import { storeLogger } from "./logger";
 import type {
-  AuthorizationCode,
-  AuthorizationRequest,
+  OAuthAuthenticationProvider,
   OAuthClient,
   OAuthJwks,
   OAuthPublicJwk,
   OAuthStore,
-  PushedAuthorizationRequest,
   StoredAccessToken,
   StoredRefreshToken
 } from "./types";
@@ -30,6 +28,7 @@ type GlobalWithStore = typeof globalThis & {
 type SupabaseOAuthTokenRow = {
   token_hash: string;
   token_type: "access" | "refresh";
+  oauth_flow_id: string;
   encrypted_token: string;
   encryption_iv: string;
   encryption_tag: string;
@@ -71,6 +70,19 @@ type SupabaseOAuthClientRow = {
   client_metadata: TokenRecord | null;
 };
 
+type SupabaseOAuthAuthenticationProviderRow = {
+  provider_id: string;
+  provider_name: string;
+  issuer: string;
+  login_url: string;
+  jwks: OAuthJwks | null;
+  jwks_uri: string | null;
+  public_key: string | null;
+  user_jwt_max_ttl_seconds: number;
+  clock_skew_seconds: number;
+  provider_metadata: TokenRecord | null;
+};
+
 const OAUTH_TOKEN_ENCRYPTION_SECRET =
   process.env.OAUTH_TOKEN_ENCRYPTION_SECRET ?? process.env.SIGNING_KEY_ENCRYPTION_SECRET;
 const OAUTH_CLIENT_CACHE_SECONDS = Number(process.env.OAUTH_CLIENT_CACHE_SECONDS ?? 60);
@@ -83,6 +95,7 @@ function createStore(): OAuthStore {
   requireSupabaseRuntime();
   return {
     clients: new Map(),
+    authenticationProviders: new Map(),
     authorizationRequests: new Map(),
     pushedRequests: new Map(),
     authorizationCodes: new Map(),
@@ -134,17 +147,22 @@ export async function refreshOAuthClients(now = Date.now(), force = false): Prom
     return;
   }
 
-  const rows = await querySupabaseClients();
-  const clients = rows.map(rowToOAuthClient);
-  getStore().clients = new Map(clients.map((client) => [client.clientId, client]));
+  const [clientRows, providerRows] = await Promise.all([
+    querySupabaseClients(),
+    querySupabaseAuthenticationProviders()
+  ]);
+  const clients = clientRows.map(rowToOAuthClient);
+  const providers = providerRows.map(rowToOAuthAuthenticationProvider);
+  const store = getStore();
+  store.clients = new Map(clients.map((client) => [client.clientId, client]));
+  store.authenticationProviders = new Map(
+    providers.map((provider) => [provider.providerId, provider])
+  );
   globalStore.__coreOauthGatewayClientsLoadedAt = now;
-  storeLogger.info((event) => {
-    event
-      .message("OAuth clients loaded")
-      .tag("oauth")
-      .tag("store")
-      .tag("clients")
-      .with("clientCount", clients.length);
+  storeLogger.info("OAuth clients loaded", {
+    clientCount: clients.length,
+    authenticationProviderCount: providers.length,
+    tags: ["oauth", "store", "clients"]
   });
 }
 
@@ -262,7 +280,8 @@ async function querySupabaseClients(): Promise<SupabaseOAuthClientRow[]> {
   url.searchParams.set("order", "client_id.asc");
 
   const response = await fetch(url, {
-    headers: supabaseHeaders()
+    headers: supabaseHeaders(),
+    cache: "no-store"
   });
 
   if (!response.ok) {
@@ -270,6 +289,35 @@ async function querySupabaseClients(): Promise<SupabaseOAuthClientRow[]> {
   }
 
   return (await response.json()) as SupabaseOAuthClientRow[];
+}
+
+async function querySupabaseAuthenticationProviders(): Promise<SupabaseOAuthAuthenticationProviderRow[]> {
+  const url = supabaseRestUrl("oauth_authentication_providers");
+  url.searchParams.set("select", [
+    "provider_id",
+    "provider_name",
+    "issuer",
+    "login_url",
+    "jwks",
+    "jwks_uri",
+    "public_key",
+    "user_jwt_max_ttl_seconds",
+    "clock_skew_seconds",
+    "provider_metadata"
+  ].join(","));
+  url.searchParams.set("active", "eq.true");
+  url.searchParams.set("order", "provider_id.asc");
+
+  const response = await fetch(url, {
+    headers: supabaseHeaders(),
+    cache: "no-store"
+  });
+
+  if (!response.ok) {
+    throw new Error(`Supabase OAuth authentication-provider query failed: ${response.status} ${await response.text()}`);
+  }
+
+  return (await response.json()) as SupabaseOAuthAuthenticationProviderRow[];
 }
 
 async function querySupabaseTokens(options: {
@@ -283,6 +331,7 @@ async function querySupabaseTokens(options: {
   url.searchParams.set("select", [
     "token_hash",
     "token_type",
+    "oauth_flow_id",
     "encrypted_token",
     "encryption_iv",
     "encryption_tag",
@@ -308,7 +357,8 @@ async function querySupabaseTokens(options: {
   }
 
   const response = await fetch(url, {
-    headers: supabaseHeaders()
+    headers: supabaseHeaders(),
+    cache: "no-store"
   });
 
   if (!response.ok) {
@@ -374,13 +424,9 @@ async function cleanupExpiredSupabaseRecords(now: number): Promise<void> {
   }
   if (response.ok) {
     const result = await response.json().catch(() => ({}));
-    storeLogger.info((event) => {
-      event
-        .message("Supabase OAuth cleanup executed")
-        .tag("oauth")
-        .tag("store")
-        .tag("cleanup")
-        .with("result", result);
+    storeLogger.info("Supabase OAuth cleanup executed", {
+      result,
+      tags: ["oauth", "store", "cleanup"]
     });
   }
 }
@@ -407,12 +453,9 @@ async function persistTokensToSupabase(store: OAuthStore): Promise<void> {
   if (!response.ok) {
     throw new Error(`Supabase OAuth token upsert failed: ${response.status} ${await response.text()}`);
   }
-  storeLogger.info((event) => {
-    event
-      .message("OAuth tokens persisted")
-      .tag("oauth")
-      .tag("store")
-      .with("tokenCount", rows.length);
+  storeLogger.info("OAuth tokens persisted", {
+    tokenCount: rows.length,
+    tags: ["oauth", "store"]
   });
 }
 
@@ -421,6 +464,7 @@ function rowToAccessToken(row: SupabaseOAuthTokenRow): StoredAccessToken {
   return {
     token,
     tokenId: row.token_hash,
+    oauthFlowId: row.oauth_flow_id,
     jwt: row.jwt ?? "",
     clientId: row.client_id,
     subject: row.subject,
@@ -437,6 +481,7 @@ function rowToRefreshToken(row: SupabaseOAuthTokenRow): StoredRefreshToken {
   return {
     token,
     tokenId: row.token_hash,
+    oauthFlowId: row.oauth_flow_id,
     clientId: row.client_id,
     subject: row.subject,
     scope: row.scope,
@@ -484,6 +529,40 @@ function rowToOAuthClient(row: SupabaseOAuthClientRow): OAuthClient {
     contactEmail: row.contact_email ?? undefined,
     clientMetadata: stripUndefined(metadata)
   };
+}
+
+function rowToOAuthAuthenticationProvider(
+  row: SupabaseOAuthAuthenticationProviderRow
+): OAuthAuthenticationProvider {
+  return {
+    providerId: row.provider_id,
+    providerName: row.provider_name,
+    issuer: row.issuer,
+    loginUrl: normalizeAuthenticationProviderLoginUrl(row.login_url, row.provider_id),
+    jwks: row.jwks?.keys?.length ? row.jwks : publicKeyToJwks(row.public_key),
+    jwksUri: row.jwks_uri ?? undefined,
+    userJwtMaxTtlSeconds: row.user_jwt_max_ttl_seconds,
+    clockSkewSeconds: row.clock_skew_seconds,
+    metadata: row.provider_metadata ?? undefined
+  };
+}
+
+function normalizeAuthenticationProviderLoginUrl(value: string, providerId: string): string {
+  try {
+    const loginUrl = new URL(value);
+    if (
+      (loginUrl.protocol !== "https:" && loginUrl.protocol !== "http:") ||
+      loginUrl.username ||
+      loginUrl.password
+    ) {
+      throw new Error("Unsupported login URL");
+    }
+    return loginUrl.toString();
+  } catch {
+    throw new Error(
+      `OAuth authentication provider "${providerId}" has an invalid login_url`
+    );
+  }
 }
 
 function publicKeyToJwks(publicKey: string | null): OAuthJwks | undefined {
@@ -552,6 +631,7 @@ function accessTokenToRow(token: StoredAccessToken): SupabaseOAuthTokenRow {
   return {
     token_hash: token.tokenId,
     token_type: "access",
+    oauth_flow_id: token.oauthFlowId,
     encrypted_token: encrypted.encryptedToken,
     encryption_iv: encrypted.encryptionIv,
     encryption_tag: encrypted.encryptionTag,
@@ -572,6 +652,7 @@ function refreshTokenToRow(token: StoredRefreshToken): SupabaseOAuthTokenRow {
   return {
     token_hash: token.tokenId,
     token_type: "refresh",
+    oauth_flow_id: token.oauthFlowId,
     encrypted_token: encrypted.encryptedToken,
     encryption_iv: encrypted.encryptionIv,
     encryption_tag: encrypted.encryptionTag,

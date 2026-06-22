@@ -1,10 +1,17 @@
 import type { NextRequest } from "next/server";
+import {
+  auditCorrelation,
+  auditHash,
+  newOAuthFlowId,
+  oauthAuditService,
+  type AuditResult
+} from "./audit";
 import { verifyClientSecret } from "./client-secrets";
 import { rememberClientAssertionJti } from "./client-assertions";
 import {
   ACCESS_TOKEN_TTL_SECONDS,
   AUTH_CODE_TTL_SECONDS,
-  AUTH_PROVIDER_LOGIN_URL,
+  AUTH_PROVIDER_JWT_MAX_TTL_SECONDS,
   CLIENT_ASSERTION_TYPE,
   JWT_BEARER_GRANT,
   JWT_BEARER_GRANT_COMPAT,
@@ -60,6 +67,7 @@ import type {
   AuthorizationCode,
   AuthorizationRequest,
   JwtPayload,
+  OAuthAuthenticationProvider,
   OAuthClient,
   OAuthJwks,
   StoredAccessToken,
@@ -78,8 +86,12 @@ type ClientAuth =
       response: Response;
     };
 
+type ClientAuthMethod = "client_secret_basic" | "private_key_jwt" | "none";
+
 type TokenSetInput = {
   client: OAuthClient;
+  oauthFlowId: string;
+  grantType: string;
   subject: string;
   scope: string;
   baseUrl: string;
@@ -88,6 +100,7 @@ type TokenSetInput = {
   authorizationDetails?: unknown;
   includeRefreshToken?: boolean;
   includeIdToken?: boolean;
+  previousRefreshTokenHash?: string;
 };
 
 const PASSWORD_USERS = loadPasswordUsers();
@@ -149,17 +162,42 @@ export async function openIdConfigurationHandler(request: NextRequest): Promise<
 }
 
 export async function authorizeHandler(request: NextRequest): Promise<Response> {
+  const oauthFlowId = newOAuthFlowId();
   await cleanupExpiredRecords();
   const baseUrl = baseUrlFromRequest(request);
   const params = await paramsWithRequestUri(request.nextUrl.searchParams);
   const validation = validateAuthorizationParams(params, true);
 
-  if (!validation.ok) return validation.response;
+  if (!validation.ok) {
+    await recordAuthorizationFailure(
+      oauthFlowId,
+      params,
+      validation.reasonCode,
+      validation.parameter
+    );
+    return validation.response;
+  }
+  const providerId = validation.client.oauthAuthenticationProvider;
+  const provider = providerId
+    ? getStore().authenticationProviders.get(providerId)
+    : undefined;
+  if (!provider) {
+    await recordAuthorizationFailure(
+      oauthFlowId,
+      params,
+      "authentication_provider_not_configured",
+      "oauth_authentication_provider"
+    );
+    return oauthError("invalid_request", "OAuth authentication provider is not configured", {
+      errorUri: RFC6749_AUTH_ERROR_URI
+    });
+  }
 
   const oauthKey = randomToken(11);
   const expiresAt = Date.now() + AUTH_CODE_TTL_SECONDS * 1000;
   const authRequest: AuthorizationRequest = {
     oauthKey,
+    oauthFlowId,
     clientId: validation.client.clientId,
     redirectUri: validation.redirectUri,
     scope: validation.scope,
@@ -184,8 +222,9 @@ export async function authorizeHandler(request: NextRequest): Promise<Response> 
     iat: issuedAt,
     exp: issuedAt + AUTH_CODE_TTL_SECONDS,
     iss: baseUrl,
-    aud: AUTH_PROVIDER_LOGIN_URL,
+    aud: provider.providerId,
     oauth_key: oauthKey,
+    oauth_flow_id: oauthFlowId,
     client_id: validation.client.clientId,
     consent_required: authRequest.consentRequired,
     scope: validation.scope,
@@ -196,9 +235,29 @@ export async function authorizeHandler(request: NextRequest): Promise<Response> 
     acr_values: optional(params, "acr_values")
   });
 
-  const loginUrl = new URL(AUTH_PROVIDER_LOGIN_URL);
+  const loginUrl = new URL(provider.loginUrl);
   loginUrl.searchParams.set("oauth_key", oauthKey);
   loginUrl.searchParams.set("oauth_key_signature", oauthKeySignature);
+
+  const authorizationAudit = await oauthAuditService.record({
+    auditType: "authorization_requested",
+    auditStatus: "SUCCESS",
+    oauthFlowId,
+    details: {
+      clientId: validation.client.clientId,
+      responseType: "code",
+      scope: validation.scope,
+      authenticationProviderId: provider.providerId
+    }
+  });
+
+  tokenLogger.info("OAuth authorization flow started", {
+    oauthFlowId,
+    clientId: validation.client.clientId,
+    authenticationProviderId: provider.providerId,
+    ...auditCorrelation(authorizationAudit),
+    tags: ["oauth", "authorization"]
+  });
 
   return jsonResponse(
     {},
@@ -215,9 +274,11 @@ export async function pushedAuthorizeHandler(request: NextRequest): Promise<Resp
   await cleanupExpiredRecords();
   const baseUrl = baseUrlFromRequest(request);
   const params = await readForm(request);
+  const oauthFlowId = newOAuthFlowId();
   const clientAuth = await authenticateClient(request, params, baseUrl, {
     allowPublic: true,
-    required: false
+    required: false,
+    oauthFlowId
   });
   const hintedClientId = params.get("client_id");
   const hintedClient = hintedClientId ? getStore().clients.get(hintedClientId) : undefined;
@@ -288,6 +349,7 @@ export async function authDetailsHandler(request: NextRequest): Promise<Response
 
 export async function userAuthorizeHandler(request: NextRequest): Promise<Response> {
   await cleanupExpiredRecords();
+  const baseUrl = baseUrlFromRequest(request);
   const body = await readJson<{ oauth_key?: string; user_jwt?: string }>(request);
   if (!body?.oauth_key) return springParameterError("oauth_key");
   if (!body.user_jwt) return springParameterError("user_jwt");
@@ -295,9 +357,79 @@ export async function userAuthorizeHandler(request: NextRequest): Promise<Respon
   const authRequest = getStore().authorizationRequests.get(body.oauth_key);
   if (!authRequest) return springParameterError("oauth_key");
 
+  const oauthClient = getStore().clients.get(authRequest.clientId);
+  const providerId = oauthClient?.oauthAuthenticationProvider;
+  const provider = providerId
+    ? getStore().authenticationProviders.get(providerId)
+    : undefined;
+  if (!oauthClient || !provider) {
+    await recordAuthenticationFailure(
+      authRequest.oauthFlowId,
+      authRequest.clientId,
+      "authentication_provider_not_configured"
+    );
+    return oauthError("invalid_request", "OAuth authentication provider is not configured", {
+      errorUri: RFC6749_AUTH_ERROR_URI
+    });
+  }
+
+  const userHeader = decodeJwtHeader(body.user_jwt);
   const userPayload = decodeJwt<TokenClaims & JwtPayload>(body.user_jwt);
-  if (!userPayload || isJwtExpired(userPayload)) {
+  const audiences = normalizeAudience(userPayload?.aud);
+  const issuedAt = typeof userPayload?.iat === "number" ? userPayload.iat : undefined;
+  const expiresAt = typeof userPayload?.exp === "number" ? userPayload.exp : undefined;
+  const effectiveMaxTtlSeconds = Math.min(
+    AUTH_PROVIDER_JWT_MAX_TTL_SECONDS,
+    provider.userJwtMaxTtlSeconds
+  );
+  const providerJwks = await resolveAuthenticationProviderJwks(provider);
+  const userJwtIsValid =
+    userHeader?.alg === "RS256" &&
+    Boolean(userHeader.kid) &&
+    Boolean(userPayload) &&
+    Boolean(stringClaim(userPayload?.sub)) &&
+    issuedAt !== undefined &&
+    issuedAt <= nowSeconds() + provider.clockSkewSeconds &&
+    expiresAt !== undefined &&
+    expiresAt > issuedAt! &&
+    expiresAt - issuedAt! <= effectiveMaxTtlSeconds &&
+    !isJwtExpired(userPayload!, provider.clockSkewSeconds) &&
+    userPayload?.iss === provider.issuer &&
+    audiences.includes(baseUrl) &&
+    Boolean(providerJwks) &&
+    verifyJwtSignature(body.user_jwt, providerJwks!);
+
+  if (!userJwtIsValid || !userPayload) {
+    await recordAuthenticationFailure(
+      authRequest.oauthFlowId,
+      authRequest.clientId,
+      "invalid_user_jwt"
+    );
     return oauthError("invalid_request", "OAuth 2.0 Parameter: user_jwt", {
+      errorUri: RFC6749_AUTH_ERROR_URI
+    });
+  }
+
+  const userId = stringClaim(userPayload.sub)!;
+  const authenticationAudit = await oauthAuditService.record({
+    auditType: "user_authenticated",
+    auditStatus: "SUCCESS",
+    oauthFlowId: authRequest.oauthFlowId,
+    details: {
+      userId,
+      clientId: authRequest.clientId
+    }
+  });
+  tokenLogger.info("User authenticated", {
+    userId,
+    clientId: authRequest.clientId,
+    ...auditCorrelation(authenticationAudit),
+    tags: ["oauth", "authentication"]
+  });
+
+  const authorizedScope = constrainUserScope(authRequest.scope, stringClaim(userPayload.scope));
+  if (!authorizedScope) {
+    return oauthError("invalid_scope", "OAuth 2.0 Parameter: scope", {
       errorUri: RFC6749_AUTH_ERROR_URI
     });
   }
@@ -305,9 +437,10 @@ export async function userAuthorizeHandler(request: NextRequest): Promise<Respon
   const code = randomToken(32);
   const authorizationCode: AuthorizationCode = {
     code,
+    oauthFlowId: authRequest.oauthFlowId,
     clientId: authRequest.clientId,
     redirectUri: authRequest.redirectUri,
-    scope: typeof userPayload.scope === "string" ? userPayload.scope : authRequest.scope,
+    scope: authorizedScope,
     state: authRequest.state,
     codeChallenge: authRequest.codeChallenge,
     codeChallengeMethod: authRequest.codeChallengeMethod,
@@ -318,8 +451,26 @@ export async function userAuthorizeHandler(request: NextRequest): Promise<Respon
     consumed: false
   };
 
+  getStore().authorizationRequests.delete(body.oauth_key);
   getStore().authorizationCodes.set(code, authorizationCode);
   await persistStore();
+
+  const codeAudit = await oauthAuditService.record({
+    auditType: "authorization_code_issued",
+    auditStatus: "SUCCESS",
+    oauthFlowId: authRequest.oauthFlowId,
+    details: {
+      clientId: authRequest.clientId,
+      userId,
+      authorizationCodeHash: auditHash(code)
+    }
+  });
+  tokenLogger.info("Authorization code issued", {
+    clientId: authRequest.clientId,
+    authorizationCodeHash: auditHash(code),
+    ...auditCorrelation(codeAudit),
+    tags: ["oauth", "authorization-code"]
+  });
 
   return jsonResponse({
     client_id: authRequest.clientId,
@@ -342,8 +493,19 @@ export async function userErrorHandler(request: NextRequest): Promise<Response> 
 
   const errorPayload = decodeJwt<TokenClaims & JwtPayload>(body.error_jwt);
   if (!errorPayload || isJwtExpired(errorPayload)) {
+    await recordAuthenticationFailure(
+      authRequest.oauthFlowId,
+      authRequest.clientId,
+      "invalid_error_jwt"
+    );
     return springParameterError("error_jwt");
   }
+
+  await recordAuthenticationFailure(
+    authRequest.oauthFlowId,
+    authRequest.clientId,
+    stringClaim(errorPayload.error) ?? "invalid_credentials"
+  );
 
   const issuedAt = nowSeconds();
   const response = await signJwt({
@@ -373,21 +535,22 @@ export async function tokenHandler(request: NextRequest): Promise<Response> {
   const grantType = required(params, "grant_type");
 
   if (!grantType) return springParameterError("grant_type");
+  const oauthFlowId = newOAuthFlowId();
 
   switch (grantType) {
     case "client_credentials":
-      return clientCredentialsGrant(request, params, baseUrl);
+      return clientCredentialsGrant(request, params, baseUrl, oauthFlowId);
     case "password":
-      return passwordGrant(request, params, baseUrl);
+      return passwordGrant(request, params, baseUrl, oauthFlowId);
     case "authorization_code":
-      return authorizationCodeGrant(request, params, baseUrl);
+      return authorizationCodeGrant(request, params, baseUrl, oauthFlowId);
     case JWT_BEARER_GRANT:
     case JWT_BEARER_GRANT_COMPAT:
-      return jwtBearerGrant(params, baseUrl);
+      return jwtBearerGrant(params, baseUrl, oauthFlowId);
     case "refresh_token":
-      return refreshTokenGrant(request, params, baseUrl);
+      return refreshTokenGrant(request, params, baseUrl, oauthFlowId);
     case TOKEN_EXCHANGE_GRANT:
-      return tokenExchangeGrant(request, params, baseUrl);
+      return tokenExchangeGrant(request, params, baseUrl, oauthFlowId);
     default:
       return oauthError("unsupported_grant_type", `OAuth 2.0 Parameter: grant_type`, {
         errorUri: RFC6749_TOKEN_ERROR_URI
@@ -403,16 +566,14 @@ export async function tokenInfoHandler(request: NextRequest): Promise<Response> 
 
   const stored = await findStoredAccessToken(token);
   if (stored && !stored.revoked && stored.expiresAt > Date.now()) {
-    tokenLogger.info((event) => {
-      event
-        .message("Opaque token exchanged for signed JWT")
-        .tag("oauth")
-        .tag("tokeninfo")
-        .with("tokenHash", tokenFingerprint(token))
-        .with("clientId", stored.clientId)
-        .with("subject", stored.subject)
-        .with("scope", stored.scope)
-        .with("expiresAt", stored.expiresAt);
+    tokenLogger.info("Opaque token exchanged for signed JWT", {
+      tokenHash: tokenFingerprint(token),
+      clientId: stored.clientId,
+      subject: stored.subject,
+      scope: stored.scope,
+      expiresAt: stored.expiresAt,
+      oauthFlowId: stored.oauthFlowId,
+      tags: ["oauth", "tokeninfo"]
     });
     return jsonResponse({
       access_token: stored.jwt
@@ -420,12 +581,9 @@ export async function tokenInfoHandler(request: NextRequest): Promise<Response> 
   }
 
   if (decodeJwt(token)) {
-    tokenLogger.info((event) => {
-      event
-        .message("JWT tokeninfo passthrough")
-        .tag("oauth")
-        .tag("tokeninfo")
-        .with("tokenHash", tokenFingerprint(token));
+    tokenLogger.info("JWT tokeninfo passthrough", {
+      tokenHash: tokenFingerprint(token),
+      tags: ["oauth", "tokeninfo"]
     });
     return jsonResponse({
       access_token: token
@@ -445,25 +603,21 @@ export async function introspectionHandler(request: NextRequest): Promise<Respon
 
   const stored = await findStoredAccessToken(token);
   if (!stored || stored.revoked || stored.expiresAt <= Date.now()) {
-    tokenLogger.info((event) => {
-      event
-        .message("Token introspection inactive")
-        .tag("oauth")
-        .tag("introspection")
-        .with("tokenHash", tokenFingerprint(token));
+    tokenLogger.info("Token introspection inactive", {
+      tokenHash: tokenFingerprint(token),
+      oauthFlowId: stored?.oauthFlowId,
+      tags: ["oauth", "introspection"]
     });
     return jsonResponse({ active: false });
   }
 
-  tokenLogger.info((event) => {
-    event
-      .message("Token introspection active")
-      .tag("oauth")
-      .tag("introspection")
-      .with("tokenHash", tokenFingerprint(token))
-      .with("clientId", stored.clientId)
-      .with("subject", stored.subject)
-      .with("scope", stored.scope);
+  tokenLogger.info("Token introspection active", {
+    tokenHash: tokenFingerprint(token),
+    clientId: stored.clientId,
+    subject: stored.subject,
+    scope: stored.scope,
+    oauthFlowId: stored.oauthFlowId,
+    tags: ["oauth", "introspection"]
   });
 
   return jsonResponse({
@@ -494,12 +648,10 @@ export async function userInfoHandler(request: NextRequest): Promise<Response> {
 
   const stored = await findStoredAccessToken(token);
   if (!stored || stored.revoked || stored.expiresAt <= Date.now()) {
-    tokenLogger.warn((event) => {
-      event
-        .message("UserInfo rejected invalid token")
-        .tag("oauth")
-        .tag("userinfo")
-        .with("tokenHash", tokenFingerprint(token));
+    tokenLogger.warn("UserInfo rejected invalid token", {
+      tokenHash: tokenFingerprint(token),
+      oauthFlowId: stored?.oauthFlowId,
+      tags: ["oauth", "userinfo"]
     });
     return oauthError("invalid_token", "The access token is invalid", {
       status: 401,
@@ -510,15 +662,13 @@ export async function userInfoHandler(request: NextRequest): Promise<Response> {
     });
   }
 
-  tokenLogger.info((event) => {
-    event
-      .message("UserInfo returned claims")
-      .tag("oauth")
-      .tag("userinfo")
-      .with("tokenHash", tokenFingerprint(token))
-      .with("clientId", stored.clientId)
-      .with("subject", stored.subject)
-      .with("scope", stored.scope);
+  tokenLogger.info("UserInfo returned claims", {
+    tokenHash: tokenFingerprint(token),
+    clientId: stored.clientId,
+    subject: stored.subject,
+    scope: stored.scope,
+    oauthFlowId: stored.oauthFlowId,
+    tags: ["oauth", "userinfo"]
   });
 
   return jsonResponse({
@@ -541,14 +691,29 @@ export async function revokeHandler(request: NextRequest): Promise<Response> {
   const token = required(params, "token");
   if (!token) return springParameterError("token");
 
+  const stored =
+    (await findStoredAccessToken(token)) ??
+    (await findStoredRefreshToken(token));
   const revoked = await revokeStoredToken(token);
-  tokenLogger.info((event) => {
-    event
-      .message("Token revocation requested")
-      .tag("oauth")
-      .tag("revocation")
-      .with("tokenHash", tokenFingerprint(token))
-      .with("revoked", revoked);
+  const oauthFlowId = stored?.oauthFlowId ?? newOAuthFlowId();
+  const audit = revoked
+    ? await oauthAuditService.record({
+        auditType: "token_revoked",
+        auditStatus: "SUCCESS",
+        oauthFlowId,
+        details: {
+          clientId: stored?.clientId,
+          userId: stored?.subject,
+          tokenHash: auditHash(token)
+        }
+      })
+    : undefined;
+  tokenLogger.info("Token revocation requested", {
+    tokenHash: auditHash(token),
+    revoked,
+    oauthFlowId,
+    ...(audit ? auditCorrelation(audit) : {}),
+    tags: ["oauth", "revocation"]
   });
 
   return emptyResponse();
@@ -639,11 +804,13 @@ export async function revokeBySubjectHandler(request: NextRequest): Promise<Resp
 async function clientCredentialsGrant(
   request: NextRequest,
   params: URLSearchParams,
-  baseUrl: string
+  baseUrl: string,
+  oauthFlowId: string
 ): Promise<Response> {
   const clientAuth = await authenticateClient(request, params, baseUrl, {
     allowPublic: false,
-    required: true
+    required: true,
+    oauthFlowId
   });
   if (!clientAuth.ok) return clientAuth.response;
 
@@ -660,6 +827,8 @@ async function clientCredentialsGrant(
   return jsonResponse(
     await createTokenSet({
       client,
+      oauthFlowId,
+      grantType: "client_credentials",
       subject: client.clientId,
       scope: scope.value,
       baseUrl
@@ -670,7 +839,8 @@ async function clientCredentialsGrant(
 async function passwordGrant(
   request: NextRequest,
   params: URLSearchParams,
-  baseUrl: string
+  baseUrl: string,
+  oauthFlowId: string
 ): Promise<Response> {
   if (!PASSWORD_GRANT_ENABLED) {
     return oauthError("unsupported_grant_type", "Password grant is disabled", {
@@ -685,12 +855,18 @@ async function passwordGrant(
 
   const clientAuth = await authenticateClient(request, params, baseUrl, {
     allowPublic: false,
-    required: true
+    required: true,
+    oauthFlowId
   });
   if (!clientAuth.ok) return clientAuth.response;
 
   const user = PASSWORD_USERS[username];
   if (!user || user.password !== password) {
+    await recordAuthenticationFailure(
+      oauthFlowId,
+      clientAuth.client.clientId,
+      "invalid_credentials"
+    );
     return oauthError("invalid_grant", "Bad credentials", {
       errorUri: RFC6749_TOKEN_ERROR_URI
     });
@@ -698,11 +874,29 @@ async function passwordGrant(
 
   const scope = normalizeRequestedScope(params.get("scope"), clientAuth.client);
   if (!scope.ok) return scope.response;
+  const subject = stringClaim(user.claims.sub) ?? username;
+  const authenticationAudit = await oauthAuditService.record({
+    auditType: "user_authenticated",
+    auditStatus: "SUCCESS",
+    oauthFlowId,
+    details: {
+      userId: subject,
+      clientId: clientAuth.client.clientId
+    }
+  });
+  tokenLogger.info("User authenticated", {
+    userId: subject,
+    clientId: clientAuth.client.clientId,
+    ...auditCorrelation(authenticationAudit),
+    tags: ["oauth", "authentication"]
+  });
 
   return jsonResponse(
     await createTokenSet({
       client: clientAuth.client,
-      subject: stringClaim(user.claims.sub) ?? username,
+      oauthFlowId,
+      grantType: "password",
+      subject,
       scope: scope.value,
       baseUrl,
       claims: user.claims,
@@ -715,7 +909,8 @@ async function passwordGrant(
 async function authorizationCodeGrant(
   request: NextRequest,
   params: URLSearchParams,
-  baseUrl: string
+  baseUrl: string,
+  fallbackOAuthFlowId: string
 ): Promise<Response> {
   const code = required(params, "code");
   if (!code) return springParameterError("code");
@@ -734,7 +929,8 @@ async function authorizationCodeGrant(
   const clientAuth = await authenticateClient(request, params, baseUrl, {
     allowPublic: true,
     required: client.type === "confidential",
-    expectedClientId: client.clientId
+    expectedClientId: client.clientId,
+    oauthFlowId: authorizationCode.oauthFlowId ?? fallbackOAuthFlowId
   });
   if (!clientAuth.ok) return clientAuth.response;
 
@@ -762,6 +958,8 @@ async function authorizationCodeGrant(
   return jsonResponse(
     await createTokenSet({
       client,
+      oauthFlowId: authorizationCode.oauthFlowId ?? fallbackOAuthFlowId,
+      grantType: "authorization_code",
       subject: stringClaim(authorizationCode.userClaims.sub) ?? "subject",
       scope: authorizationCode.scope,
       baseUrl,
@@ -774,18 +972,34 @@ async function authorizationCodeGrant(
   );
 }
 
-async function jwtBearerGrant(params: URLSearchParams, baseUrl: string): Promise<Response> {
+async function jwtBearerGrant(
+  params: URLSearchParams,
+  baseUrl: string,
+  oauthFlowId: string
+): Promise<Response> {
   const assertion = required(params, "assertion");
   if (!assertion) return springParameterError("assertion");
 
   const header = decodeJwtHeader(assertion);
   const payload = decodeJwt<TokenClaims & JwtPayload>(assertion);
   if (!header || header.alg !== "RS256" || !header.kid || !payload || isJwtExpired(payload)) {
+    await recordClientAuthenticationFailure(
+      oauthFlowId,
+      "invalid_client_assertion",
+      stringClaim(payload?.iss),
+      "private_key_jwt"
+    );
     return oauthError("invalid_grant", "OAuth 2.0 Parameter: assertion", {
       errorUri: RFC6749_TOKEN_ERROR_URI
     });
   }
   if (!payload.jti || typeof payload.jti !== "string") {
+    await recordClientAuthenticationFailure(
+      oauthFlowId,
+      "invalid_client_assertion",
+      stringClaim(payload.iss),
+      "private_key_jwt"
+    );
     return oauthError("invalid_grant", "OAuth 2.0 Parameter: jti", {
       errorUri: RFC6749_TOKEN_ERROR_URI
     });
@@ -800,7 +1014,15 @@ async function jwtBearerGrant(params: URLSearchParams, baseUrl: string): Promise
 
   const issuerClient = typeof payload.iss === "string" ? getStore().clients.get(payload.iss) : undefined;
   const client = issuerClient;
-  if (!client) return invalidClient();
+  if (!client) {
+    await recordClientAuthenticationFailure(
+      oauthFlowId,
+      "unknown_client",
+      stringClaim(payload.iss),
+      "private_key_jwt"
+    );
+    return invalidClient();
+  }
   if (!client.grantTypes.includes(JWT_BEARER_GRANT) && !client.grantTypes.includes(JWT_BEARER_GRANT_COMPAT)) {
     return oauthError("unauthorized_client", "OAuth 2.0 Parameter: grant_type", {
       errorUri: RFC6749_TOKEN_ERROR_URI
@@ -809,31 +1031,62 @@ async function jwtBearerGrant(params: URLSearchParams, baseUrl: string): Promise
 
   const clientJwks = await resolveClientJwks(client);
   if (!clientJwks || !verifyJwtSignature(assertion, clientJwks)) {
-    clientAuthLogger.warn((event) => {
-      event
-        .message("JWT bearer assertion signature validation failed")
-        .tag("oauth")
-        .tag("jwt-bearer")
-        .with("clientId", client.clientId)
-        .with("kid", header.kid);
+    clientAuthLogger.warn("JWT bearer assertion signature validation failed", {
+      clientId: client.clientId,
+      kid: header.kid,
+      tags: ["oauth", "jwt-bearer"]
     });
+    await recordClientAuthenticationFailure(
+      oauthFlowId,
+      "invalid_client_assertion",
+      client.clientId,
+      "private_key_jwt"
+    );
     return oauthError("invalid_grant", "OAuth 2.0 Parameter: assertion", {
       errorUri: RFC6749_TOKEN_ERROR_URI
     });
   }
   if (!(await rememberClientAssertionJti(client.clientId, payload.jti, payload.exp))) {
+    await recordClientAuthenticationFailure(
+      oauthFlowId,
+      "client_assertion_replay",
+      client.clientId,
+      "private_key_jwt"
+    );
     return oauthError("invalid_grant", "OAuth 2.0 Parameter: jti", {
       errorUri: RFC6749_TOKEN_ERROR_URI
     });
   }
 
+  const clientAudit = await oauthAuditService.record({
+    auditType: "client_authenticated",
+    auditStatus: "SUCCESS",
+    oauthFlowId,
+    details: {
+      clientId: client.clientId,
+      authenticationMethod: "private_key_jwt"
+    }
+  });
+  clientAuthLogger.info("Client authenticated", {
+    clientId: client.clientId,
+    method: "private_key_jwt",
+    ...auditCorrelation(clientAudit),
+    tags: ["oauth", "client-auth", "jwt-bearer"]
+  });
+
   const scope = normalizeRequestedScope(params.get("scope") ?? stringClaim(payload.scope), client);
   if (!scope.ok) return scope.response;
-  const subject = stringClaim(payload.sub) ?? client.clientId;
+  const subject =
+    stringClaim(payload.userId) ??
+    stringClaim(payload.user_id) ??
+    stringClaim(payload.sub) ??
+    client.clientId;
 
   return jsonResponse(
     await createTokenSet({
       client,
+      oauthFlowId,
+      grantType: JWT_BEARER_GRANT,
       subject,
       scope: scope.value,
       baseUrl,
@@ -846,7 +1099,8 @@ async function jwtBearerGrant(params: URLSearchParams, baseUrl: string): Promise
 async function refreshTokenGrant(
   request: NextRequest,
   params: URLSearchParams,
-  baseUrl: string
+  baseUrl: string,
+  fallbackOAuthFlowId: string
 ): Promise<Response> {
   const refreshToken = required(params, "refresh_token");
   if (!refreshToken) return springParameterError("refresh_token");
@@ -872,12 +1126,15 @@ async function refreshTokenGrant(
   return jsonResponse(
     await createTokenSet({
       client,
+      oauthFlowId: stored.oauthFlowId ?? fallbackOAuthFlowId,
+      grantType: "refresh_token",
       subject: stored.subject,
       scope: scope.value,
       baseUrl,
       claims: stored.userClaims,
       includeRefreshToken: true,
-      includeIdToken: splitScope(scope.value).includes("openid")
+      includeIdToken: splitScope(scope.value).includes("openid"),
+      previousRefreshTokenHash: auditHash(refreshToken)
     })
   );
 }
@@ -885,11 +1142,13 @@ async function refreshTokenGrant(
 async function tokenExchangeGrant(
   request: NextRequest,
   params: URLSearchParams,
-  baseUrl: string
+  baseUrl: string,
+  fallbackOAuthFlowId: string
 ): Promise<Response> {
   const clientAuth = await authenticateClient(request, params, baseUrl, {
     allowPublic: false,
-    required: true
+    required: true,
+    oauthFlowId: fallbackOAuthFlowId
   });
   if (!clientAuth.ok) return clientAuth.response;
 
@@ -914,6 +1173,8 @@ async function tokenExchangeGrant(
   return jsonResponse(
     await createTokenSet({
       client: clientAuth.client,
+      oauthFlowId: stored?.oauthFlowId ?? fallbackOAuthFlowId,
+      grantType: TOKEN_EXCHANGE_GRANT,
       subject,
       scope: scope.value,
       baseUrl,
@@ -934,6 +1195,7 @@ async function authenticateClient(
     allowPublic: boolean;
     required: boolean;
     expectedClientId?: string;
+    oauthFlowId: string;
   }
 ): Promise<ClientAuth> {
   const store = getStore();
@@ -941,62 +1203,115 @@ async function authenticateClient(
   if (basic) {
     const client = store.clients.get(basic.clientId);
     if (!client || !client.authMethods.includes("client_secret_basic") || !isClientSecretValid(client, basic.clientSecret)) {
-      clientAuthLogger.warn((event) => {
-        event
-          .message("Client basic authentication failed")
-          .tag("oauth")
-          .tag("client-auth")
-          .with("clientId", basic.clientId)
-          .with("method", "client_secret_basic");
+      clientAuthLogger.warn("Client basic authentication failed", {
+        clientId: basic.clientId,
+        method: "client_secret_basic",
+        tags: ["oauth", "client-auth"]
       });
-      return { ok: false, response: invalidClient() };
+      return clientAuthenticationFailed(
+        invalidClient(),
+        options.oauthFlowId,
+        "invalid_client_secret",
+        basic.clientId,
+        "client_secret_basic"
+      );
     }
     if (options.expectedClientId && options.expectedClientId !== client.clientId) {
-      return { ok: false, response: invalidClient() };
+      return clientAuthenticationFailed(
+        invalidClient(),
+        options.oauthFlowId,
+        "client_id_mismatch",
+        client.clientId,
+        "client_secret_basic"
+      );
     }
-    clientAuthLogger.info((event) => {
-      event
-        .message("Client authenticated")
-        .tag("oauth")
-        .tag("client-auth")
-        .with("clientId", client.clientId)
-        .with("method", "client_secret_basic");
-    });
-    return { ok: true, client, method: "client_secret_basic" };
+    return clientAuthenticationSucceeded(
+      client,
+      "client_secret_basic",
+      options.oauthFlowId
+    );
   }
 
   const assertion = params.get("client_assertion");
   const assertionType = params.get("client_assertion_type");
   if (assertion || assertionType) {
     if (assertionType !== CLIENT_ASSERTION_TYPE) {
-      return { ok: false, response: springParameterError("client_assertion_type") };
+      return clientAuthenticationFailed(
+        springParameterError("client_assertion_type"),
+        options.oauthFlowId,
+        "invalid_client_assertion_type",
+        undefined,
+        "private_key_jwt"
+      );
     }
     if (!assertion) {
-      return { ok: false, response: springParameterError("client_assertion") };
+      return clientAuthenticationFailed(
+        springParameterError("client_assertion"),
+        options.oauthFlowId,
+        "missing_client_assertion",
+        undefined,
+        "private_key_jwt"
+      );
     }
 
     const header = decodeJwtHeader(assertion);
     const payload = decodeJwt(assertion);
     if (!header || header.alg !== "RS256" || !header.kid) {
-      return { ok: false, response: invalidClient("Client assertion signature is invalid") };
+      return clientAuthenticationFailed(
+        invalidClient("Client assertion signature is invalid"),
+        options.oauthFlowId,
+        "invalid_client_assertion",
+        undefined,
+        "private_key_jwt"
+      );
     }
     if (!payload || isJwtExpired(payload)) {
-      return { ok: false, response: invalidClient("Client assertion is invalid") };
+      return clientAuthenticationFailed(
+        invalidClient("Client assertion is invalid"),
+        options.oauthFlowId,
+        "invalid_client_assertion",
+        undefined,
+        "private_key_jwt"
+      );
     }
 
     const clientId = stringClaim(payload.iss) ?? stringClaim(payload.sub);
     const client = clientId ? store.clients.get(clientId) : undefined;
     if (!client || !client.authMethods.includes("private_key_jwt")) {
-      return { ok: false, response: invalidClient() };
+      return clientAuthenticationFailed(
+        invalidClient(),
+        options.oauthFlowId,
+        "invalid_client_assertion",
+        clientId,
+        "private_key_jwt"
+      );
     }
     if (options.expectedClientId && options.expectedClientId !== client.clientId) {
-      return { ok: false, response: invalidClient() };
+      return clientAuthenticationFailed(
+        invalidClient(),
+        options.oauthFlowId,
+        "client_id_mismatch",
+        client.clientId,
+        "private_key_jwt"
+      );
     }
     if (payload.sub !== client.clientId || payload.iss !== client.clientId) {
-      return { ok: false, response: invalidClient("Client assertion subject is invalid") };
+      return clientAuthenticationFailed(
+        invalidClient("Client assertion subject is invalid"),
+        options.oauthFlowId,
+        "invalid_client_assertion",
+        client.clientId,
+        "private_key_jwt"
+      );
     }
     if (!payload.jti || typeof payload.jti !== "string") {
-      return { ok: false, response: invalidClient("Client assertion jti is required") };
+      return clientAuthenticationFailed(
+        invalidClient("Client assertion jti is required"),
+        options.oauthFlowId,
+        "invalid_client_assertion",
+        client.clientId,
+        "private_key_jwt"
+      );
     }
 
     const audiences = normalizeAudience(payload.aud);
@@ -1007,71 +1322,237 @@ async function authenticateClient(
       !audiences.includes(`${baseUrl}/oauth2/v1/token`) &&
       !audiences.includes(currentRequestUrl)
     ) {
-      return { ok: false, response: invalidClient("Client assertion audience is invalid") };
+      clientAuthLogger.warn("Client assertion baseUrl", {
+        baseUrl: baseUrl,
+        currentRequestUrl: currentRequestUrl,
+        audiences: audiences
+      });
+      return clientAuthenticationFailed(
+        invalidClient("Client assertion audience is invalid"),
+        options.oauthFlowId,
+        "invalid_client_assertion",
+        client.clientId,
+        "private_key_jwt"
+      );
     }
 
     const clientJwks = await resolveClientJwks(client);
     if (!clientJwks || !verifyJwtSignature(assertion, clientJwks)) {
-      clientAuthLogger.warn((event) => {
-        event
-          .message("Client assertion signature validation failed")
-          .tag("oauth")
-          .tag("client-auth")
-          .with("clientId", client.clientId)
-          .with("method", "private_key_jwt")
-          .with("kid", header.kid);
+      clientAuthLogger.warn("Client assertion signature validation failed", {
+        clientId: client.clientId,
+        method: "private_key_jwt",
+        kid: header.kid,
+        tags: ["oauth", "client-auth"]
       });
-      return { ok: false, response: invalidClient("Client assertion signature is invalid") };
+      return clientAuthenticationFailed(
+        invalidClient("Client assertion signature is invalid"),
+        options.oauthFlowId,
+        "invalid_client_assertion",
+        client.clientId,
+        "private_key_jwt"
+      );
     }
 
     if (!(await rememberClientAssertionJti(client.clientId, payload.jti, payload.exp))) {
-      clientAuthLogger.warn((event) => {
-        event
-          .message("Client assertion replay rejected")
-          .tag("oauth")
-          .tag("client-auth")
-          .with("clientId", client.clientId)
-          .with("method", "private_key_jwt")
-          .with("jti", payload.jti);
+      clientAuthLogger.warn("Client assertion replay rejected", {
+        clientId: client.clientId,
+        method: "private_key_jwt",
+        jti: payload.jti,
+        tags: ["oauth", "client-auth"]
       });
-      return { ok: false, response: invalidClient("Client assertion was already used") };
+      return clientAuthenticationFailed(
+        invalidClient("Client assertion was already used"),
+        options.oauthFlowId,
+        "client_assertion_replay",
+        client.clientId,
+        "private_key_jwt"
+      );
     }
-
-    clientAuthLogger.info((event) => {
-      event
-        .message("Client authenticated")
-        .tag("oauth")
-        .tag("client-auth")
-        .with("clientId", client.clientId)
-        .with("method", "private_key_jwt")
-        .with("kid", header.kid)
-        .with("jti", payload.jti);
-    });
-
-    return {
-      ok: true,
+    return clientAuthenticationSucceeded(
       client,
-      method: "private_key_jwt",
-      assertionPayload: payload
-    };
+      "private_key_jwt",
+      options.oauthFlowId,
+      payload,
+      { kid: header.kid, jti: payload.jti }
+    );
   }
 
   const clientId = params.get("client_id");
   if (clientId) {
     const client = store.clients.get(clientId);
-    if (!client) return { ok: false, response: invalidClient() };
+    if (!client) {
+      return clientAuthenticationFailed(
+        invalidClient(),
+        options.oauthFlowId,
+        "unknown_client",
+        clientId,
+        "none"
+      );
+    }
     if (options.expectedClientId && options.expectedClientId !== client.clientId) {
-      return { ok: false, response: invalidClient() };
+      return clientAuthenticationFailed(
+        invalidClient(),
+        options.oauthFlowId,
+        "client_id_mismatch",
+        client.clientId,
+        "none"
+      );
     }
     if (client.type === "public" && options.allowPublic) {
-      return { ok: true, client, method: "none" };
+      return clientAuthenticationSucceeded(client, "none", options.oauthFlowId);
     }
-    if (!options.required) return { ok: true, client, method: "none" };
+    if (!options.required) {
+      return clientAuthenticationSucceeded(client, "none", options.oauthFlowId);
+    }
   }
 
-  if (options.required) return { ok: false, response: invalidClient() };
+  return clientAuthenticationFailed(
+    invalidClient(),
+    options.oauthFlowId,
+    options.required ? "client_authentication_required" : "invalid_client",
+    clientId ?? undefined,
+    "none"
+  );
+}
 
-  return { ok: false, response: invalidClient() };
+async function clientAuthenticationSucceeded(
+  client: OAuthClient,
+  method: ClientAuthMethod,
+  oauthFlowId: string,
+  assertionPayload?: JwtPayload,
+  metadata: Record<string, unknown> = {}
+): Promise<ClientAuth> {
+  if (method === "none") {
+    clientAuthLogger.info("Public client identified", {
+      clientId: client.clientId,
+      method,
+      oauthFlowId,
+      tags: ["oauth", "client"]
+    });
+    return {
+      ok: true,
+      client,
+      method,
+      assertionPayload
+    };
+  }
+
+  const audit = await oauthAuditService.record({
+    auditType: "client_authenticated",
+    auditStatus: "SUCCESS",
+    oauthFlowId,
+    details: {
+      clientId: client.clientId,
+      authenticationMethod: method
+    }
+  });
+  clientAuthLogger.info("Client authenticated", {
+    clientId: client.clientId,
+    method,
+    ...metadata,
+    ...auditCorrelation(audit),
+    tags: ["oauth", "client-auth"]
+  });
+
+  return {
+    ok: true,
+    client,
+    method,
+    assertionPayload
+  };
+}
+
+async function clientAuthenticationFailed(
+  response: Response,
+  oauthFlowId: string,
+  reasonCode: string,
+  clientId?: string,
+  method?: ClientAuthMethod
+): Promise<ClientAuth> {
+  await recordClientAuthenticationFailure(
+    oauthFlowId,
+    reasonCode,
+    clientId,
+    method
+  );
+
+  return { ok: false, response };
+}
+
+async function recordClientAuthenticationFailure(
+  oauthFlowId: string,
+  reasonCode: string,
+  clientId?: string,
+  method?: ClientAuthMethod
+): Promise<AuditResult> {
+  const audit = await oauthAuditService.record({
+    auditType: "client_authentication_failed",
+    auditStatus: "FAILURE",
+    oauthFlowId,
+    details: {
+      reasonCode,
+      clientId,
+      authenticationMethod: method
+    }
+  });
+  clientAuthLogger.warn("Client authentication failed", {
+    reasonCode,
+    clientId,
+    method,
+    ...auditCorrelation(audit),
+    tags: ["oauth", "client-auth"]
+  });
+  return audit;
+}
+
+async function recordAuthenticationFailure(
+  oauthFlowId: string,
+  clientId: string,
+  reasonCode: string
+): Promise<AuditResult> {
+  const audit = await oauthAuditService.record({
+    auditType: "authentication_failed",
+    auditStatus: "FAILURE",
+    oauthFlowId,
+    details: {
+      clientId,
+      reasonCode
+    }
+  });
+  tokenLogger.warn("User authentication failed", {
+    clientId,
+    reasonCode,
+    ...auditCorrelation(audit),
+    tags: ["oauth", "authentication"]
+  });
+  return audit;
+}
+
+async function recordAuthorizationFailure(
+  oauthFlowId: string,
+  params: URLSearchParams,
+  reasonCode: string,
+  parameter?: string
+): Promise<AuditResult> {
+  const clientId = optional(params, "client_id");
+  const audit = await oauthAuditService.record({
+    auditType: "authorization_failed",
+    auditStatus: "FAILURE",
+    oauthFlowId,
+    details: {
+      clientId,
+      reasonCode,
+      parameter
+    }
+  });
+  tokenLogger.warn("OAuth authorization request rejected", {
+    clientId,
+    reasonCode,
+    parameter,
+    ...auditCorrelation(audit),
+    tags: ["oauth", "authorization"]
+  });
+  return audit;
 }
 
 function isClientSecretValid(client: OAuthClient, providedSecret: string): boolean {
@@ -1086,7 +1567,27 @@ async function resolveClientJwks(client: OAuthClient): Promise<OAuthJwks | null>
   const response = await fetch(client.jwksUri, {
     headers: {
       Accept: "application/json"
-    }
+    },
+    cache: "no-store"
+  });
+
+  if (!response.ok) return null;
+
+  const jwks = (await response.json()) as OAuthJwks;
+  return Array.isArray(jwks.keys) ? jwks : null;
+}
+
+async function resolveAuthenticationProviderJwks(
+  provider: OAuthAuthenticationProvider
+): Promise<OAuthJwks | null> {
+  if (provider.jwks?.keys?.length) return provider.jwks;
+  if (!provider.jwksUri) return null;
+
+  const response = await fetch(provider.jwksUri, {
+    headers: {
+      Accept: "application/json"
+    },
+    cache: "no-store"
   });
 
   if (!response.ok) return null;
@@ -1101,33 +1602,65 @@ function validateAuthorizationParams(
   preAuthenticatedClient?: OAuthClient
 ):
   | { ok: true; client: OAuthClient; redirectUri: string; scope: string }
-  | { ok: false; response: Response } {
+  | { ok: false; response: Response; reasonCode: string; parameter?: string } {
   const responseType = required(params, "response_type");
   if (!responseType) {
-    return { ok: false, response: springParameterError("response_type", { authEndpoint: true }) };
+    return {
+      ok: false,
+      response: springParameterError("response_type", { authEndpoint: true }),
+      reasonCode: "missing_response_type",
+      parameter: "response_type"
+    };
   }
   if (responseType !== "code") {
     return {
       ok: false,
       response: oauthError("unsupported_response_type", "OAuth 2.0 Parameter: response_type", {
         errorUri: RFC6749_AUTH_ERROR_URI
-      })
+      }),
+      reasonCode: "unsupported_response_type",
+      parameter: "response_type"
     };
   }
 
   const clientId = params.get("client_id") ?? preAuthenticatedClient?.clientId;
   if (!clientId) {
-    return { ok: false, response: springParameterError("client_id", { authEndpoint: true }) };
+    return {
+      ok: false,
+      response: springParameterError("client_id", { authEndpoint: true }),
+      reasonCode: "missing_client_id",
+      parameter: "client_id"
+    };
   }
 
   const client = preAuthenticatedClient ?? getStore().clients.get(clientId);
   if (!client) {
-    return { ok: false, response: springParameterError("client_id", { authEndpoint: true }) };
+    return {
+      ok: false,
+      response: springParameterError("client_id", { authEndpoint: true }),
+      reasonCode: "unknown_client",
+      parameter: "client_id"
+    };
+  }
+  if (!client.grantTypes.includes("authorization_code")) {
+    return {
+      ok: false,
+      response: oauthError("unauthorized_client", "OAuth 2.0 Parameter: response_type", {
+        errorUri: RFC6749_AUTH_ERROR_URI
+      }),
+      reasonCode: "authorization_code_grant_not_allowed",
+      parameter: "response_type"
+    };
   }
 
   const redirectUri = params.get("redirect_uri") ?? client.redirectUris[0];
   if (!redirectUri || !client.redirectUris.includes(redirectUri)) {
-    return { ok: false, response: springParameterError("redirect_uri", { authEndpoint: true }) };
+    return {
+      ok: false,
+      response: springParameterError("redirect_uri", { authEndpoint: true }),
+      reasonCode: "invalid_redirect_uri",
+      parameter: "redirect_uri"
+    };
   }
 
   const scope = normalizeRequestedScope(params.get("scope"), client, true);
@@ -1140,14 +1673,36 @@ function validateAuthorizationParams(
           "invalid_scope",
           "OAuth 2.0 Parameter: scope",
           params.get("state") ?? undefined
-        )
+        ),
+        reasonCode: "invalid_scope",
+        parameter: "scope"
       };
     }
-    return { ok: false, response: scope.response };
+    return {
+      ok: false,
+      response: scope.response,
+      reasonCode: "invalid_scope",
+      parameter: "scope"
+    };
   }
 
-  if (client.requirePkce && params.get("code_challenge") && params.get("code_challenge_method") !== "S256") {
-    return { ok: false, response: springParameterError("code_challenge_method", { authEndpoint: true }) };
+  if (client.requirePkce) {
+    if (!params.get("code_challenge")) {
+      return {
+        ok: false,
+        response: springParameterError("code_challenge", { authEndpoint: true }),
+        reasonCode: "missing_code_challenge",
+        parameter: "code_challenge"
+      };
+    }
+    if (params.get("code_challenge_method") !== "S256") {
+      return {
+        ok: false,
+        response: springParameterError("code_challenge_method", { authEndpoint: true }),
+        reasonCode: "invalid_code_challenge_method",
+        parameter: "code_challenge_method"
+      };
+    }
   }
 
   return {
@@ -1198,6 +1753,7 @@ async function createTokenSet(input: TokenSetInput): Promise<Record<string, unkn
   const stored: StoredAccessToken = {
     token: accessToken,
     tokenId: tokenHash(accessToken),
+    oauthFlowId: input.oauthFlowId,
     jwt: accessJwt,
     clientId: input.client.clientId,
     subject: input.subject,
@@ -1215,13 +1771,16 @@ async function createTokenSet(input: TokenSetInput): Promise<Record<string, unkn
     token_type: "Bearer",
     expires_in: accessTokenTtlSeconds
   };
+  let refreshTokenHash: string | undefined;
 
   if (input.includeRefreshToken) {
     const refreshToken = randomToken(32);
     const refreshTokenId = tokenHash(refreshToken);
+    refreshTokenHash = auditHash(refreshToken);
     getStore().refreshTokens.set(refreshToken, {
       token: refreshToken,
       tokenId: refreshTokenId,
+      oauthFlowId: input.oauthFlowId,
       clientId: input.client.clientId,
       subject: input.subject,
       scope: input.scope,
@@ -1243,18 +1802,51 @@ async function createTokenSet(input: TokenSetInput): Promise<Record<string, unkn
 
   await persistStore();
 
-  tokenLogger.info((event) => {
-    event
-      .message("Token set issued")
-      .tag("oauth")
-      .tag("token")
-      .with("accessTokenHash", tokenId)
-      .with("clientId", input.client.clientId)
-      .with("subject", input.subject)
-      .with("scope", input.scope)
-      .with("expiresAt", expiresAt)
-      .with("refreshTokenIssued", Boolean(response.refresh_token))
-      .with("idTokenIssued", Boolean(response.id_token));
+  const tokensAudit = await oauthAuditService.record({
+    auditType: "tokens_issued",
+    auditStatus: "SUCCESS",
+    oauthFlowId: input.oauthFlowId,
+    details: {
+      clientId: input.client.clientId,
+      userId: input.subject,
+      grantType: input.grantType,
+      accessTokenHash: auditHash(accessToken),
+      refreshTokenHash
+    }
+  });
+
+  if (input.previousRefreshTokenHash && refreshTokenHash) {
+    const refreshAudit = await oauthAuditService.record({
+      auditType: "refresh_token_used",
+      auditStatus: "SUCCESS",
+      oauthFlowId: input.oauthFlowId,
+      details: {
+        clientId: input.client.clientId,
+        userId: input.subject,
+        oldRefreshTokenHash: input.previousRefreshTokenHash,
+        newRefreshTokenHash: refreshTokenHash
+      }
+    });
+    tokenLogger.info("Refresh token used", {
+      oldRefreshTokenHash: input.previousRefreshTokenHash,
+      newRefreshTokenHash: refreshTokenHash,
+      clientId: input.client.clientId,
+      ...auditCorrelation(refreshAudit),
+      tags: ["oauth", "refresh-token"]
+    });
+  }
+
+  tokenLogger.info("Token set issued", {
+    accessTokenHash: auditHash(accessToken),
+    clientId: input.client.clientId,
+    subject: input.subject,
+    scope: input.scope,
+    expiresAt,
+    refreshTokenIssued: Boolean(response.refresh_token),
+    idTokenIssued: Boolean(response.id_token),
+    grantType: input.grantType,
+    ...auditCorrelation(tokensAudit),
+    tags: ["oauth", "token"]
   });
 
   return response;
@@ -1313,6 +1905,14 @@ function splitScope(scope: string): string[] {
     .split(/\s+/)
     .map((item) => item.trim())
     .filter(Boolean);
+}
+
+function constrainUserScope(requestedScope: string, providerScope?: string): string {
+  if (!providerScope) return requestedScope;
+  const approved = new Set(splitScope(providerScope));
+  return splitScope(requestedScope)
+    .filter((scope) => approved.has(scope))
+    .join(" ");
 }
 
 function required(params: URLSearchParams, key: string): string | null {
