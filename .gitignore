@@ -3,6 +3,7 @@ node_modules
 supabase
 keystore
 out
+docs
 dist
 .env
 .env.*
