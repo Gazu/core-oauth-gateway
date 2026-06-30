@@ -1,6 +1,6 @@
 .next
 node_modules
-supabase
+/supabase/
 keystore
 out
 docs

@@ -1,14 +1,12 @@
-export const CLIENT_ASSERTION_TYPE =
-  "urn:ietf:params:oauth:client-assertion-type:jwt-bearer";
-export const JWT_BEARER_GRANT = "urn:ietf:params:oauth:grant-type:jwt-bearer";
-export const JWT_BEARER_GRANT_COMPAT = "urn:ietf:params:grant-type:jwt-bearer";
-export const TOKEN_EXCHANGE_GRANT = "urn:ietf:params:oauth:grant-type:token-exchange";
-
-export const RFC6749_TOKEN_ERROR_URI =
-  "https://datatracker.ietf.org/doc/html/rfc6749#section-5.2";
-export const RFC6749_AUTH_ERROR_URI =
-  "https://datatracker.ietf.org/doc/html/rfc6749#section-4.1.2.1";
-export const RFC7636_ERROR_URI = "https://datatracker.ietf.org/doc/html/rfc7636#section-4.6";
+export {
+  CLIENT_ASSERTION_TYPE,
+  JWT_BEARER_GRANT,
+  JWT_BEARER_GRANT_COMPAT,
+  RFC6749_AUTH_ERROR_URI,
+  RFC6749_TOKEN_ERROR_URI,
+  RFC7636_ERROR_URI,
+  TOKEN_EXCHANGE_GRANT
+} from "./domain/value-objects/oauth-protocol";
 
 export const ACCESS_TOKEN_TTL_SECONDS = Number(process.env.ACCESS_TOKEN_TTL_SECONDS ?? 300);
 export const AUTH_CODE_TTL_SECONDS = Number(process.env.AUTH_CODE_TTL_SECONDS ?? 60);

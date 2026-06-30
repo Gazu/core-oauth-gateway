@@ -11,6 +11,8 @@
     "start": "if [ -f .env.local ]; then HOSTNAME=0.0.0.0 node --env-file=.env.local .next/standalone/server.js; else HOSTNAME=0.0.0.0 node .next/standalone/server.js; fi",
     "lint": "eslint .",
     "test": "vitest run",
+    "test:unit": "vitest run tests/unit",
+    "test:integration": "vitest run tests/integration",
     "typecheck": "tsc --noEmit",
     "verify:jwt": "node scripts/verify-jwt.mjs",
     "client:assertion": "service-framework-js client-assertion",

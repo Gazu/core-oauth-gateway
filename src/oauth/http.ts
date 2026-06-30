@@ -1,10 +1,7 @@
 import { NextResponse, type NextRequest } from "next/server";
 import { randomUUID } from "crypto";
 import { getCurrentTraceContext } from "@smb-tech/service-framework-js";
-import {
-  RFC6749_AUTH_ERROR_URI,
-  RFC6749_TOKEN_ERROR_URI
-} from "./config";
+import { oauthLogger } from "./logger";
 
 type HeadersInput = HeadersInit | undefined;
 
@@ -67,34 +64,17 @@ export function oauthError(
   if (description) body.error_description = description;
   if (init?.errorUri) body.error_uri = init.errorUri;
 
+  oauthLogger.error(description ?? error, {
+    error,
+    errorDescription: description,
+    status: init?.status ?? 400,
+    errorUri: init?.errorUri,
+    tags: ["oauth", "http", "error"]
+  });
+
   return jsonResponse(body, {
     status: init?.status ?? 400,
     headers: init?.headers
-  });
-}
-
-export function springParameterError(
-  parameter: string,
-  init?: {
-    status?: number;
-    authEndpoint?: boolean;
-    headers?: HeadersInput;
-  }
-): NextResponse {
-  return oauthError("invalid_request", `OAuth 2.0 Parameter: ${parameter}`, {
-    status: init?.status ?? 400,
-    errorUri: init?.authEndpoint ? RFC6749_AUTH_ERROR_URI : RFC6749_TOKEN_ERROR_URI,
-    headers: init?.headers
-  });
-}
-
-export function invalidClient(description = "Client authentication failed"): NextResponse {
-  return oauthError("invalid_client", description, {
-    status: 401,
-    errorUri: RFC6749_TOKEN_ERROR_URI,
-    headers: {
-      "WWW-Authenticate": `Basic realm="core-oauth-gateway", error="invalid_client", error_description="${description}"`
-    }
   });
 }
 
@@ -135,27 +115,6 @@ export function paramsToRecord(params: URLSearchParams): Record<string, string> 
     record[key] = value;
   }
   return record;
-}
-
-export function redirectWithOAuthError(
-  redirectUri: string,
-  error: string,
-  description?: string,
-  state?: string,
-  errorUri = RFC6749_AUTH_ERROR_URI
-): NextResponse {
-  const location = new URL(redirectUri);
-  location.searchParams.set("error", error);
-  if (description) location.searchParams.set("error_description", description);
-  if (errorUri) location.searchParams.set("error_uri", errorUri);
-  if (state) location.searchParams.set("state", state);
-
-  return emptyResponse({
-    status: 302,
-    headers: {
-      Location: location.toString()
-    }
-  });
 }
 
 function mergeParams(primary: URLSearchParams, fallback: URLSearchParams): URLSearchParams {

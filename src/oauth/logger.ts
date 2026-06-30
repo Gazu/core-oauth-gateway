@@ -68,7 +68,16 @@ export function createOAuthLogger(
 export function withOAuthRequestLogging(_handlerName: string, handler: Handler): Handler {
   return service.route(async (request) => {
     await loggerInitialization;
-    return handler(request as NextRequest);
+    try {
+      return await handler(request as NextRequest);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Unexpected OAuth error";
+      oauthLogger.error(message, {
+        tags: ["oauth", "http", "exception"],
+        exception: error
+      });
+      throw error;
+    }
   });
 }
 

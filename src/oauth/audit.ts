@@ -5,6 +5,10 @@ import {
 } from "@smb-tech/service-framework-js";
 import { supabaseHeaders, supabaseRestUrl } from "./infrastructure/supabase";
 import { auditLogger } from "./logger";
+import {
+  isAuditRootCauseCode,
+  type AuditRootCauseCode
+} from "./domain/value-objects/audit-root-cause";
 
 export const AUDIT_TYPES = [
   "authorization_requested",
@@ -39,6 +43,8 @@ export type AuditEventInput = {
   auditType: AuditType;
   auditStatus: AuditStatus;
   oauthFlowId: string;
+  reasonCode?: string;
+  rootCauseCode?: AuditRootCauseCode;
   details?: Record<string, unknown>;
 };
 
@@ -51,6 +57,8 @@ export type AuditEvent = Record<string, unknown> & {
   spanId: string;
   oauthFlowId: string;
   eventTimestamp: string;
+  reasonCode?: string;
+  rootCauseCode?: AuditRootCauseCode;
 };
 
 export type AuditResult = {
@@ -61,6 +69,20 @@ export type AuditResult = {
   persisted: boolean;
   persistenceSkipped?: boolean;
   failureReasonCode?: AuditFailureReasonCode;
+};
+
+export type AuditEventPersistenceRow = {
+  audit_id: string;
+  audit_type: AuditType;
+  audit_status: AuditStatus;
+  request_id: string;
+  trace_id: string;
+  span_id: string;
+  oauth_flow_id: string;
+  event_timestamp: string;
+  reason_code: string | null;
+  root_cause_code: AuditRootCauseCode | null;
+  event_payload: AuditEvent;
 };
 
 type AuditServiceOptions = {
@@ -79,7 +101,9 @@ const RESERVED_EVENT_FIELDS = new Set([
   "traceId",
   "spanId",
   "oauthFlowId",
-  "eventTimestamp"
+  "eventTimestamp",
+  "reasonCode",
+  "rootCauseCode"
 ]);
 const AUDIT_TIMEOUT_MS = Number(process.env.OAUTH_AUDIT_TIMEOUT_MS ?? 2000);
 const DEFAULT_AUDIT_PERSISTENCE_MODE =
@@ -128,6 +152,7 @@ export class OAuthAuditService {
     this.safeLog("info", "Audit event started", {
       ...correlation,
       auditStatus: "STARTED",
+      ...auditFailureClassification(input),
       tags: ["oauth", "audit"]
     });
 
@@ -223,6 +248,24 @@ function validateAuditInput(input: AuditEventInput): void {
   if (input.auditStatus !== "SUCCESS" && input.auditStatus !== "FAILURE") {
     throw new AuditFailure("audit_validation_failed", "Invalid audit event status");
   }
+  if (input.reasonCode !== undefined) {
+    if (
+      input.auditStatus !== "FAILURE" ||
+      typeof input.reasonCode !== "string" ||
+      input.reasonCode.trim().length === 0
+    ) {
+      throw new AuditFailure("audit_validation_failed", "Invalid audit reason code");
+    }
+  }
+  if (input.rootCauseCode !== undefined) {
+    if (
+      input.auditStatus !== "FAILURE" ||
+      !input.reasonCode ||
+      !isAuditRootCauseCode(input.rootCauseCode)
+    ) {
+      throw new AuditFailure("audit_validation_failed", "Invalid audit root cause code");
+    }
+  }
   for (const key of Object.keys(input.details ?? {})) {
     if (RESERVED_EVENT_FIELDS.has(key)) {
       throw new AuditFailure("audit_validation_failed", `Reserved audit field: ${key}`);
@@ -259,7 +302,17 @@ function createAuditEvent(
     spanId: trace.spanId,
     oauthFlowId: input.oauthFlowId,
     eventTimestamp: timestamp.toISOString(),
+    ...auditFailureClassification(input),
     ...(input.details ?? {})
+  };
+}
+
+function auditFailureClassification(
+  input: Pick<AuditEventInput, "reasonCode" | "rootCauseCode">
+): Pick<AuditEvent, "reasonCode" | "rootCauseCode"> {
+  return {
+    ...(input.reasonCode ? { reasonCode: input.reasonCode } : {}),
+    ...(input.rootCauseCode ? { rootCauseCode: input.rootCauseCode } : {})
   };
 }
 
@@ -282,17 +335,7 @@ async function persistAuditEvent(event: AuditEvent): Promise<void> {
         ...supabaseHeaders(),
         Prefer: "return=minimal"
       },
-      body: JSON.stringify({
-        audit_id: event.auditId,
-        audit_type: event.auditType,
-        audit_status: event.auditStatus,
-        request_id: event.requestId,
-        trace_id: event.traceId,
-        span_id: event.spanId,
-        oauth_flow_id: event.oauthFlowId,
-        event_timestamp: event.eventTimestamp,
-        event_payload: event
-      }),
+      body: JSON.stringify(auditEventPersistenceRow(event)),
       signal: controller.signal
     });
 
@@ -311,6 +354,22 @@ async function persistAuditEvent(event: AuditEvent): Promise<void> {
   } finally {
     clearTimeout(timeout);
   }
+}
+
+export function auditEventPersistenceRow(event: AuditEvent): AuditEventPersistenceRow {
+  return {
+    audit_id: event.auditId,
+    audit_type: event.auditType,
+    audit_status: event.auditStatus,
+    request_id: event.requestId,
+    trace_id: event.traceId,
+    span_id: event.spanId,
+    oauth_flow_id: event.oauthFlowId,
+    event_timestamp: event.eventTimestamp,
+    reason_code: event.reasonCode ?? null,
+    root_cause_code: event.rootCauseCode ?? null,
+    event_payload: event
+  };
 }
 
 function auditFailureReason(error: unknown): AuditFailureReasonCode {

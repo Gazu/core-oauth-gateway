@@ -14,13 +14,7 @@ import {
 } from "@smb-tech/service-framework-js";
 import { getActiveSigningKey, publicJwks } from "./signing-keys";
 import type { JwtPayload, OAuthJwks } from "./types";
-
-export type JwtHeader = {
-  typ?: string;
-  alg?: string;
-  kid?: string;
-  [key: string]: unknown;
-};
+import type { JwtHeader } from "./domain/value-objects/token-claims";
 
 export async function publicJwkSet() {
   return publicJwks();

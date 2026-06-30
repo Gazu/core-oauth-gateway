@@ -23,6 +23,7 @@ Cross-cutting Next.js tracing, structured logging, error presentation, JWT primi
 - `POST /oauth2/v1/revokeById`
 - `POST /oauth2/v1/revokeBySID`
 - `GET|POST /oauth2/v1/userinfo`
+- `GET /info`
 - `GET /health`
 - `GET /.well-known/openid-configuration`
 - `GET /.well-known/oauth-authorization-server`
@@ -278,11 +279,52 @@ OAUTH_PASSWORD_USERS_JSON='{"user":{"password":"<password>","claims":{"sub":"use
 
 Do not commit real password-grant users or credentials.
 
+## Architecture
+
+The OAuth implementation follows hexagonal boundaries while keeping `src/app/**/route.ts` adapters thin:
+
+- `src/app`: Next.js App Router adapters; routes delegate directly to HTTP controllers.
+- `src/oauth/domain/entities`: OAuth clients, providers, authorization records, and token entities.
+- `src/oauth/domain/value-objects`: claims, JWK/JWKS, and OAuth parameter types.
+- `src/oauth/domain`: pure claim and scope policies with no Next.js or HTTP dependencies.
+- `src/oauth/application/dto`: framework-independent request and OAuth response contracts.
+- `src/oauth/application/ports`: contracts for persistence, JWT operations, auditing, client security, configuration, health, logging, and maintenance.
+- `src/oauth/application/use-cases`: authorization, discovery, health, token issuance, introspection, userinfo, and revocation cases.
+- `src/oauth/application/services/grants`: independent strategies for authorization code, client credentials, JWT bearer, password, refresh token, and token exchange grants.
+- `src/oauth/application/services`: client authentication, token issuance, and functional audit coordination.
+- `src/oauth/interfaces/http`: controllers, request validators, and response presenters.
+- `src/oauth/infrastructure/http`: shared Next.js request lifecycle and tracing adapter.
+- `src/oauth/infrastructure/persistence/supabase`: separate adapters for OAuth client/transient state and persisted access/refresh tokens.
+- `src/oauth/infrastructure/security`: JWT, token encryption, client-secret verification, replay protection, and remote JWKS adapters.
+- `src/oauth/infrastructure/audit`, `config`, `health`, and `maintenance`: outbound adapters implementing application ports.
+- `src/container.ts`: the composition root that creates adapters once and injects them into every use case.
+
+Application code depends only on ports and domain types. HTTP controllers resolve use cases from the composition root and never instantiate concrete infrastructure. Authorization requests, PAR records, and authorization codes remain process-local inside the state adapter; OAuth clients, providers, tokens, signing keys, replay JTIs, and audit events use Supabase.
+
+OAuth error responses are logged at `ERROR` using the same `error_description` returned by the protocol response. Unhandled exceptions are logged with their original message before the shared HTTP framework converts them to a sanitized `500` response. Sensitive fields continue to pass through centralized redaction.
+
+## Tests
+
+Tests follow the same architectural boundaries as the service:
+
+- `tests/unit`: domain policies, application use cases, OAuth token flows, JWT, audit, logging, and runtime portability.
+- `tests/integration`: the complete public route inventory, thin-controller boundaries, response headers, tracing, and sanitized HTTP errors.
+
+Run them independently or together:
+
+```bash
+npm run test:unit
+npm run test:integration
+npm run test
+```
+
+The OAuth flow tests use injected in-memory ports. They cover JWT bearer issuance, refresh-token issuance, custom-claim introspection, token revocation, authorization-code exchange, S256 PKCE validation, and authorization-code replay rejection without using production credentials.
+
 ## Audit Events
 
 Functional audit events complement OAuth operational logs; they do not replace them. A UUID `oauthFlowId` is created as soon as `/oauth2/v1/authorize` starts, including rejected requests, and follows a valid authorization request, authorization code, access token, and refresh token. Token-only grants create a new flow identifier. Introspection and revocation recover it from the persisted token.
 
-Every event contains `auditId`, `auditType`, `auditStatus`, `requestId`, `traceId`, `spanId`, `oauthFlowId`, and `eventTimestamp`. Event-specific fields are stored in the same JSON payload. Supported audit types are:
+Every event contains `auditId`, `auditType`, `auditStatus`, `requestId`, `traceId`, `spanId`, `oauthFlowId`, and `eventTimestamp`. Failed events can additionally contain a stable functional `reasonCode` and a more specific internal `rootCauseCode`. These classifications are persisted as `reason_code` and `root_cause_code` columns and remain available inside `event_payload`. They are written to audit and OAuth logs but are never exposed in public OAuth error responses. Event-specific fields are stored in the same JSON payload. Supported audit types are:
 
 - `authorization_requested`
 - `authorization_failed`
@@ -308,12 +350,16 @@ Audit lifecycle logs remain enabled in every mode. An unsupported value is repor
 Tokens, authorization codes, and refresh tokens are represented only as `sha256:<base64url>` hashes. Query a complete flow from Supabase with:
 
 ```sql
-select event_timestamp, audit_type, audit_status, audit_id, request_id,
-       trace_id, span_id, event_payload
+select event_timestamp, audit_type, audit_status, reason_code, root_cause_code,
+       audit_id, request_id, trace_id, span_id, event_payload
 from public.oauth_audit_events
 where oauth_flow_id = '<oauth-flow-id>'::uuid
 order by event_timestamp, audit_id;
 ```
+
+Apply `database/migrations/20260630_add_audit_failure_classification.sql` before deploying code that writes the classification columns.
+
+`database/scripts/DESTRUCTIVE_recreate_oauth_audit_events.sql` recreates the table with columns in logical physical order. It permanently deletes every existing audit event and is intended only for an environment where losing audit history is explicitly acceptable. Stop the service before executing it and restart the service after the transaction commits.
 
 ## Health Check
 
@@ -323,6 +369,26 @@ Example:
 
 ```bash
 curl -s https://core-oauth-gateway.onrender.com/health
+```
+
+## Service Info
+
+`GET /info` returns static service metadata without checking Supabase. It matches the operational contract used by `core-login-provider`.
+
+Example:
+
+```bash
+curl -s https://core-oauth-gateway.onrender.com/info
+```
+
+Response:
+
+```json
+{
+  "service_name": "core-oauth-gateway",
+  "service_version": "0.2.0",
+  "environment": "production"
+}
 ```
 
 ## Render Deployment
